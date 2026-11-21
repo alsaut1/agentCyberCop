@@ -32,8 +32,11 @@ sed "s/\"sha256\": \"[0-9a-f]*\"/\"sha256\": \"$(sha256sum fake-agent-tampered |
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout srv.key -out srv.crt -days 1 \
   -subj /CN=localhost -addext subjectAltName=DNS:localhost 2>/dev/null
 # main: an unrelated key, spare: the test key — so the spare key is checked too
-sed "s|^RELEASE_KEYS=\"\"|RELEASE_KEYS=\"main:$(tr -d '\n' < third.pub) spare:$TEST_PUB\"|" "$ROOT/dist/install.sh" > install-test.sh
-cp "$ROOT/dist/install.sh" install-nokeys.sh
+# The real keys and MIN_VERSION are replaced by test ones; the rest of the installer is used as is.
+sed -e "s|^RELEASE_KEYS=\".*\"|RELEASE_KEYS=\"main:$(tr -d '\n' < third.pub) spare:$TEST_PUB\"|" \
+  -e 's|^MIN_VERSION=".*"|MIN_VERSION="0.1.0"|' "$ROOT/dist/install.sh" > install-test.sh
+sed -e 's|^RELEASE_KEYS=".*"|RELEASE_KEYS=""|' -e 's|^MIN_VERSION=".*"|MIN_VERSION="0.1.0"|' "$ROOT/dist/install.sh" > install-nokeys.sh
+grep -q "spare:$TEST_PUB" install-test.sh && grep -q '^RELEASE_KEYS=""' install-nokeys.sh || { echo "key substitution failed"; exit 1; }
 python3 srv.py www srv.crt srv.key & SRV=$!; sleep 1
 for img in docker.io/library/debian:12 docker.io/library/ubuntu:22.04 docker.io/library/ubuntu:24.04 docker.io/rockylinux/rockylinux:9; do
   case $img in *rocky*) prep='dnf -q -y install openssl >/dev/null 2>&1';; *) prep='apt-get -qq update >/dev/null && apt-get -qq install -y curl openssl ca-certificates >/dev/null 2>&1';; esac

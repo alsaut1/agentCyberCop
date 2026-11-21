@@ -10,9 +10,11 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 pub const PREFIX: &str = "cybercop-agent-release-v1";
 
-/// Production public keys (base64, Ed25519). Filled in before the first build for clients; until then a release build
-/// trusts no key and refuses every update.
-pub const PRODUCTION_KEYS: &[(&str, &str)] = &[];
+/// Production public keys (base64, Ed25519): main and spare, made by the maintainer offline (2026-11-21).
+pub const PRODUCTION_KEYS: &[(&str, &str)] = &[
+    ("main", "v1uiLKxvYbHr42+wVOqPtFOWNk/IxiElaVT1uGvRg+k="),
+    ("spare", "ilfuIb2sW3tq5YJQDx9fLwRicTvrA+8j8VO498GVIuQ="),
+];
 
 /// Test key for development and automated tests. Its secret half is in the test code and is public on purpose.
 pub const TEST_KEY: (&str, &str) = ("test", "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
