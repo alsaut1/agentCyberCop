@@ -160,8 +160,10 @@ if ([int]$os.BuildNumber -lt 14393) { Die "Windows Server 2016 or newer is requi
 if (-not [Environment]::Is64BitOperatingSystem) { Die "a 64-bit Windows is required" }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ("cybercop-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $tmp | Out-Null
+# The download goes straight into the agent's folder (not %TEMP%): that folder is what the administrator adds to the
+# antivirus exclusions, so the file is not deleted half-way.
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+$file = Join-Path $BinDir "cybercop-agent.download"
 try {
     try {
         $rel = Invoke-RestMethod -UseBasicParsing -Uri "$Server/agent-api/v1/release?arch=$Arch"
@@ -171,7 +173,6 @@ try {
     $version = [string]$rel.version; $sha = ([string]$rel.sha256).ToLower(); $sig = [string]$rel.signature
     if ($version -notmatch '^\d+\.\d+\.\d+$' -or $sha -notmatch '^[0-9a-f]{64}$' -or -not $sig) { Die "the control centre gave an unusable answer; not installing" }
     if ((Compare-Version $version $MinVersion) -lt 0) { Die "the control centre offers $version, older than this installer ($MinVersion); not installing" }
-    $file = Join-Path $tmp "cybercop-agent.exe"
     Invoke-WebRequest -UseBasicParsing -Uri "$Server/agent-api/v1/download/$version/$Arch" -OutFile $file
     $got = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLower()
     if ($got -ne $sha) { Die "checksum mismatch, not installing" }
@@ -191,8 +192,7 @@ try {
         Stop-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
     }
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) { Stop-Service -Name $ServiceName -Force }
-    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-    Copy-Item -Force -Path $file -Destination $Bin
+    Move-Item -Force -Path $file -Destination $Bin
     if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
         # New-Service keeps the quotes around the path (sc.exe create loses them under PowerShell 5.1).
         New-Service -Name $ServiceName -BinaryPathName "`"$Bin`" run" -DisplayName "HT CYBERCOP agent" -StartupType Automatic | Out-Null
@@ -225,5 +225,5 @@ try {
     Start-ScheduledTask -TaskName $ServiceName
     Say "installed $version; the first inventory appears in the control centre within a few minutes"
 } finally {
-    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    Remove-Item -Force $file -ErrorAction SilentlyContinue
 }

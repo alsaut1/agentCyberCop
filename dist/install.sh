@@ -19,7 +19,7 @@ set -eu
 SERVER="https://agent.cybercop.gtva.net"
 # Oldest version this installer accepts: the version of the tag it was published with. An older signed version may
 # have known holes, so a control centre cannot push one to a new server.
-MIN_VERSION="0.1.2"
+MIN_VERSION="0.2.0"
 # Release keys, "name:base64-public-key" separated by spaces: main and spare (the maintainer keeps the secret halves
 # offline). Without keys nothing can be installed.
 RELEASE_KEYS="main:v1uiLKxvYbHr42+wVOqPtFOWNk/IxiElaVT1uGvRg+k= spare:ilfuIb2sW3tq5YJQDx9fLwRicTvrA+8j8VO498GVIuQ="

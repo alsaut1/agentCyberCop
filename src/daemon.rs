@@ -33,13 +33,13 @@ struct Timers {
 #[cfg(unix)]
 pub fn run() -> i32 {
     if state::is_revoked() {
-        crate::log(&format!("revoked in the control centre, nothing to do"));
+        crate::log("revoked in the control centre, nothing to do");
         return 0;
     }
     let (cfg, key) = match (state::config(), state::key()) {
         (Ok(c), Ok(k)) => (c, k),
         _ => {
-            crate::log(&format!("not enrolled (run `cybercop-agent enroll <code>`)"));
+            crate::log("not enrolled (run `cybercop-agent enroll <code>`)");
             return 1;
         }
     };
@@ -106,6 +106,6 @@ pub fn run() -> i32 {
 pub fn revoked() -> i32 {
     state::mark_revoked();
     state::drop_pending("inventory");
-    crate::log(&format!("the control centre revoked this agent; stopping"));
+    crate::log("the control centre revoked this agent; stopping");
     0
 }
