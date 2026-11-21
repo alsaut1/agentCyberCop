@@ -49,7 +49,7 @@ pub fn plugin_header(text: &str) -> Option<(String, String)> {
     let mut name = None;
     let mut version = None;
     for line in text.lines().take(60) {
-        let l = line.trim_start_matches(|c: char| c == '*' || c == ' ' || c == '/' || c == '\t');
+        let l = line.trim_start_matches(['*', ' ', '/', '\t']);
         if let Some(v) = l.strip_prefix("Plugin Name:") {
             name = Some(v.trim().to_string());
         } else if let Some(v) = l.strip_prefix("Version:") {

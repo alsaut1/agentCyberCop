@@ -65,11 +65,10 @@ fn read(resp: Result<ureq::Response, ureq::Error>) -> Result<serde_json::Value, 
             if code == 401 && err == "revoked" {
                 return Err(Error::Revoked);
             }
-            if code == 401 && err == "clock" {
-                if let Some(t) = body["server_time"].as_i64() {
+            if code == 401 && err == "clock"
+                && let Some(t) = body["server_time"].as_i64() {
                     CLOCK_OFFSET.store(t - crate::inventory::now() as i64, Ordering::Relaxed);
                 }
-            }
             Err(Error::Refused(code, err))
         }
         Err(e) => Err(Error::Network(e.to_string())),

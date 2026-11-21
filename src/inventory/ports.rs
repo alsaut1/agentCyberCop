@@ -66,11 +66,10 @@ fn socket_owners() -> HashMap<u64, String> {
         for fd in fds.flatten() {
             if let Ok(target) = fs::read_link(fd.path()) {
                 let t = target.to_string_lossy();
-                if let Some(inode) = t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
-                    if let Ok(i) = inode.parse() {
+                if let Some(inode) = t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']'))
+                    && let Ok(i) = inode.parse() {
                         map.entry(i).or_insert_with(|| comm.clone());
                     }
-                }
             }
         }
     }

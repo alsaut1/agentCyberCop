@@ -22,8 +22,8 @@ die() { say "$*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root: curl -fsSL $SERVER/install.sh | sudo sh -s -- CODE"
 
 if [ "${1:-}" = "--uninstall" ]; then
-  systemctl disable --now cybercop-agent 2>/dev/null || true
-  rm -f "$UNIT" "$BIN"
+  systemctl disable --now cybercop-agent cybercop-agent-update.path 2>/dev/null || true
+  rm -f "$UNIT" "$BIN" /etc/systemd/system/cybercop-agent-update.service /etc/systemd/system/cybercop-agent-update.path
   systemctl daemon-reload 2>/dev/null || true
   rm -rf "$STATE"
   id "$USER_NAME" >/dev/null 2>&1 && userdel "$USER_NAME" 2>/dev/null || true
@@ -94,6 +94,27 @@ Nice=10
 WantedBy=multi-user.target
 UNIT
 
+# Root updater: started when the agent has downloaded and checked a signed version; checks it again on its own copy.
+cat > /etc/systemd/system/cybercop-agent-update.service <<UNIT
+[Unit]
+Description=HT CYBERCOP agent updater (installs a signed version only)
+
+[Service]
+Type=oneshot
+ExecStart=$BIN apply-update
+UNIT
+cat > /etc/systemd/system/cybercop-agent-update.path <<UNIT
+[Unit]
+Description=HT CYBERCOP agent: a downloaded update is waiting
+
+[Path]
+PathExists=$STATE/update/ready
+Unit=cybercop-agent-update.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 if [ ! -f "$STATE/agent.json" ]; then
   if command -v runuser >/dev/null 2>&1; then
     runuser -u "$USER_NAME" -- "$BIN" enroll --server "$SERVER" "$CODE" || die "registration failed"
@@ -102,5 +123,5 @@ if [ ! -f "$STATE/agent.json" ]; then
   fi
 fi
 systemctl daemon-reload
-systemctl enable --now cybercop-agent >/dev/null
+systemctl enable --now cybercop-agent cybercop-agent-update.path >/dev/null
 say "installed $VERSION; the first inventory appears in the control centre within a few minutes"

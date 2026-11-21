@@ -2,15 +2,18 @@
 
 mod client;
 mod daemon;
+mod indicators;
 mod inventory;
+mod release;
 mod state;
+mod update;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_SERVER: &str = "https://agent.cybercop.gtva.net";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cybercop-agent <command>\n\n  enroll [--server URL] CODE   register this server with a one-time code from the control centre\n  run                           work as a service\n  inventory                     print the inventory as JSON (nothing is sent)\n  version                       print the version"
+        "usage: cybercop-agent <command>\n\n  enroll [--server URL] CODE   register this server with a one-time code from the control centre\n  run                           work as a service\n  inventory                     print the inventory as JSON (nothing is sent)\n  indicators                    print the break-in indicators as JSON (nothing is sent)\n  version                       print the version"
     );
     std::process::exit(2)
 }
@@ -76,6 +79,11 @@ fn main() {
     let code = match args.get(1).map(String::as_str) {
         Some("enroll") => enroll(&args[2..]),
         Some("run") => daemon::run(),
+        Some("apply-update") => update::apply_command(),
+        Some("indicators") => {
+            println!("{}", serde_json::to_string_pretty(&indicators::collect()).expect("json"));
+            0
+        }
         Some("inventory") => {
             println!("{}", serde_json::to_string_pretty(&inventory::collect()).expect("json"));
             0

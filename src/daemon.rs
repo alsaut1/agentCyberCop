@@ -8,6 +8,7 @@ const TICK: u64 = 30;
 
 struct Timers {
     last_heartbeat: u64,
+    last_indicators: u64,
     last_inventory: u64,
     db_stamp: u64,
     want_inventory: bool,
@@ -27,7 +28,8 @@ pub fn run() -> i32 {
     };
     let heartbeat_every = if cfg.heartbeat > 0 { cfg.heartbeat } else { 300 };
     let inventory_every = if cfg.inventory > 0 { cfg.inventory } else { 6 * 3600 };
-    let mut t = Timers { last_heartbeat: 0, last_inventory: 0, db_stamp: 0, want_inventory: true };
+    let indicators_every = if cfg.indicators > 0 { cfg.indicators } else { 900 };
+    let mut t = Timers { last_heartbeat: 0, last_indicators: 0, last_inventory: 0, db_stamp: 0, want_inventory: true };
     loop {
         let now = inventory::now();
         if now.saturating_sub(t.last_heartbeat) >= heartbeat_every {
@@ -38,9 +40,21 @@ pub fn run() -> i32 {
                     if answer["inventory_now"].as_bool() == Some(true) {
                         t.want_inventory = true;
                     }
+                    if let Ok(offer) = serde_json::from_value::<crate::update::Offer>(answer["update"].clone())
+                        && let Err(e) = crate::update::fetch(&offer) {
+                            eprintln!("cybercop-agent: update not taken: {e}");
+                        }
                 }
                 Err(client::Error::Revoked) => return revoked(),
                 Err(e) => eprintln!("cybercop-agent: heartbeat: {e}"),
+            }
+        }
+        if now.saturating_sub(t.last_indicators) >= indicators_every {
+            let body = serde_json::to_vec(&crate::indicators::collect()).expect("json");
+            match client::signed(&cfg.server, &cfg.agent_id, &key, "/agent-api/v1/indicators", &body) {
+                Ok(_) => t.last_indicators = now,
+                Err(client::Error::Revoked) => return revoked(),
+                Err(e) => eprintln!("cybercop-agent: indicators: {e}"),
             }
         }
         let stamp = inventory::packages::db_stamp();
