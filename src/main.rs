@@ -2,14 +2,28 @@
 
 mod client;
 mod daemon;
+#[cfg(unix)]
 mod indicators;
+#[cfg(unix)]
 mod inventory;
 mod release;
 mod state;
 mod update;
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+use win::{indicators, inventory};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_SERVER: &str = "https://agent.cybercop.gtva.net";
+
+/// A line for the service log. Linux: stderr, which systemd keeps in the journal. Windows: also a log file in the
+/// state folder (`log\<process>.log`, the last ~1 MB), because a Windows service has no stderr.
+pub fn log(msg: &str) {
+    eprintln!("cybercop-agent: {msg}");
+    #[cfg(windows)]
+    win::log_file(msg);
+}
 
 fn usage() -> ! {
     eprintln!(
@@ -78,7 +92,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str) {
         Some("enroll") => enroll(&args[2..]),
+        #[cfg(unix)]
         Some("run") => daemon::run(),
+        #[cfg(windows)]
+        Some("run") => win::service::run(),
+        #[cfg(windows)]
+        Some("run-console") => win::service::run_console(),
+        #[cfg(windows)]
+        Some("system-tick") => win::tick::run(),
         Some("apply-update") => update::apply_command(),
         Some("indicators") => {
             println!("{}", serde_json::to_string_pretty(&indicators::collect()).expect("json"));

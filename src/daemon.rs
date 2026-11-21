@@ -1,11 +1,27 @@
 //! The agent loop: heartbeat every 5 minutes, full inventory every 6 hours, right after packages change, or when the
 //! client presses «Check now». If the control centre is unreachable the inventory waits on disk and goes later.
 
-use crate::{client, inventory, state};
+use crate::{client, state};
+#[cfg(unix)]
+use crate::inventory;
+#[cfg(unix)]
 use std::time::Duration;
 
-const TICK: u64 = 30;
+pub const TICK: u64 = 30;
 
+/// One heartbeat: tells the version and platform, takes an offered update (download and check only). → whether the
+/// client asked for a fresh inventory («Check now»).
+pub fn heartbeat(cfg: &state::Config, key: &ed25519_dalek::SigningKey) -> Result<bool, client::Error> {
+    let body = serde_json::json!({"version": crate::VERSION, "arch": crate::update::ARCH}).to_string();
+    let answer = client::signed(&cfg.server, &cfg.agent_id, key, "/agent-api/v1/heartbeat", body.as_bytes())?;
+    if let Ok(offer) = serde_json::from_value::<crate::update::Offer>(answer["update"].clone())
+        && let Err(e) = crate::update::fetch(&offer) {
+            crate::log(&format!("update not taken: {e}"));
+        }
+    Ok(answer["inventory_now"].as_bool() == Some(true))
+}
+
+#[cfg(unix)]
 struct Timers {
     last_heartbeat: u64,
     last_indicators: u64,
@@ -14,15 +30,16 @@ struct Timers {
     want_inventory: bool,
 }
 
+#[cfg(unix)]
 pub fn run() -> i32 {
     if state::is_revoked() {
-        eprintln!("cybercop-agent: revoked in the control centre, nothing to do");
+        crate::log(&format!("revoked in the control centre, nothing to do"));
         return 0;
     }
     let (cfg, key) = match (state::config(), state::key()) {
         (Ok(c), Ok(k)) => (c, k),
         _ => {
-            eprintln!("cybercop-agent: not enrolled (run `cybercop-agent enroll <code>`)");
+            crate::log(&format!("not enrolled (run `cybercop-agent enroll <code>`)"));
             return 1;
         }
     };
@@ -33,17 +50,12 @@ pub fn run() -> i32 {
     loop {
         let now = inventory::now();
         if now.saturating_sub(t.last_heartbeat) >= heartbeat_every {
-            let body = serde_json::json!({"version": crate::VERSION}).to_string();
-            match client::signed(&cfg.server, &cfg.agent_id, &key, "/agent-api/v1/heartbeat", body.as_bytes()) {
-                Ok(answer) => {
+            match heartbeat(&cfg, &key) {
+                Ok(inventory_now) => {
                     t.last_heartbeat = now;
-                    if answer["inventory_now"].as_bool() == Some(true) {
+                    if inventory_now {
                         t.want_inventory = true;
                     }
-                    if let Ok(offer) = serde_json::from_value::<crate::update::Offer>(answer["update"].clone())
-                        && let Err(e) = crate::update::fetch(&offer) {
-                            eprintln!("cybercop-agent: update not taken: {e}");
-                        }
                 }
                 Err(client::Error::Revoked) => return revoked(),
                 Err(e) => eprintln!("cybercop-agent: heartbeat: {e}"),
@@ -78,7 +90,7 @@ pub fn run() -> i32 {
                 }
                 Err(client::Error::Revoked) => return revoked(),
                 Err(e) => {
-                    eprintln!("cybercop-agent: inventory kept for later: {e}");
+                    crate::log(&format!("inventory kept for later: {e}"));
                     t.want_inventory = false;
                     t.last_inventory = now.saturating_sub(inventory_every).saturating_add(TICK * 10); // retry in ~5 min
                 }
@@ -91,9 +103,9 @@ pub fn run() -> i32 {
     }
 }
 
-fn revoked() -> i32 {
+pub fn revoked() -> i32 {
     state::mark_revoked();
     state::drop_pending("inventory");
-    eprintln!("cybercop-agent: the control centre revoked this agent; stopping");
+    crate::log(&format!("the control centre revoked this agent; stopping"));
     0
 }

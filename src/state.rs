@@ -4,11 +4,18 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+const DEFAULT_DIR: &str = "/var/lib/cybercop-agent";
+/// Windows: the installer gives this folder to SYSTEM, Administrators and the agent's service account only.
+#[cfg(windows)]
+const DEFAULT_DIR: &str = r"C:\ProgramData\CybercopAgent";
+
 pub fn dir() -> PathBuf {
-    std::env::var_os("CYBERCOP_AGENT_STATE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/lib/cybercop-agent"))
+    std::env::var_os("CYBERCOP_AGENT_STATE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_DIR))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -23,11 +30,18 @@ pub struct Config {
     pub inventory: u64,
 }
 
-fn write_private(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
+/// Write atomically. Unix: mode 0600. Windows: the file inherits the folder's access list (see DEFAULT_DIR).
+pub fn write_private(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
+    drop(f);
+    #[cfg(unix)]
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(tmp, path)
 }
@@ -56,10 +70,12 @@ pub fn config() -> std::io::Result<Config> {
     serde_json::from_slice(&data).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
+#[cfg(unix)]
 pub fn save_pending(name: &str, data: &[u8]) -> std::io::Result<()> {
     write_private(&dir().join(format!("pending-{name}.json")), data)
 }
 
+#[cfg(unix)]
 pub fn take_pending(name: &str) -> Option<Vec<u8>> {
     fs::read(dir().join(format!("pending-{name}.json"))).ok()
 }

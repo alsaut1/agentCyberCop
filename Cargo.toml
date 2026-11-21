@@ -12,6 +12,19 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation", "Win32_System_Com", "Win32_System_UpdateAgent", "Win32_System_Ole", "Win32_System_Variant",
+    "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_NetManagement", "Win32_System_Services", "Win32_System_Threading",
+    "Win32_System_SystemInformation", "Win32_Security", "Win32_Storage_FileSystem",
+] }
+windows-service = "=0.8.1"
+winreg = "=0.56.0"
+
+[build-dependencies]
+embed-resource = "=3.0.12"
+
 [features]
 # Development build: also allows plain HTTP to localhost and (later) the test signing key. Never shipped.
 dev = []

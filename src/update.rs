@@ -1,4 +1,5 @@
-//! Self-update in two steps, so that the read-only agent never gets the right to replace itself:
+//! Self-update in two steps, so that the read-only agent never gets the right to replace itself
+//! (Windows: the agent service runs under its own unprivileged account, step 2 is the SYSTEM task, see `win::tick`):
 //!
 //! 1. The agent (user cybercop-agent) downloads the new version offered by the control centre into its state
 //!    directory, checks the SHA-256 and the signature, and writes `update/ready` with the version and signature.
@@ -12,19 +13,37 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
 pub const BIN: &str = "/usr/local/bin/cybercop-agent";
+#[cfg(windows)]
+pub const BIN: &str = r"C:\Program Files\CybercopAgent\cybercop-agent.exe";
+/// Part of the signed message, so a signature for one platform's file never fits another's.
+#[cfg(unix)]
 pub const ARCH: &str = "x86_64";
+#[cfg(windows)]
+pub const ARCH: &str = "windows-x86_64";
 const MAX_SIZE: u64 = 64 * 1024 * 1024;
-const O_NOFOLLOW: i32 = 0o400000; // Linux: refuse to open a symbolic link
+#[cfg(unix)]
+const NOFOLLOW: u32 = 0o400000; // Linux O_NOFOLLOW: refuse to open a symbolic link
+#[cfg(windows)]
+const NOFOLLOW: u32 = 0x0020_0000; // FILE_FLAG_OPEN_REPARSE_POINT: open a link itself, not its target
 
-/// Read a file the agent user controls without following symbolic links (the reader may be root).
+/// Read a file the agent account controls without following links (the reader may be root or SYSTEM).
 fn read_plain(path: &Path) -> Result<Vec<u8>, String> {
-    let f = fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !f.metadata().map_err(|e| e.to_string())?.is_file() {
+    #[cfg(unix)]
+    let f = fs::OpenOptions::new().read(true).custom_flags(NOFOLLOW as i32).open(path);
+    #[cfg(windows)]
+    let f = fs::OpenOptions::new().read(true).custom_flags(NOFOLLOW).open(path);
+    let f = f.map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = f.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(format!("{}: not a regular file", path.display()));
     }
     let mut data = Vec::new();
@@ -74,7 +93,7 @@ pub fn fetch(offer: &Offer) -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::write(dir.join("cybercop-agent.new"), &data).map_err(|e| e.to_string())?;
     fs::write(dir.join("ready"), serde_json::to_vec(offer).expect("json")).map_err(|e| e.to_string())?;
-    eprintln!("cybercop-agent: version {} downloaded, signed with the {key} key; waiting for the updater", offer.version);
+    crate::log(&format!("version {} downloaded, signed with the {key} key; waiting for the updater", offer.version));
     Ok(())
 }
 
@@ -90,7 +109,17 @@ pub fn apply(state: &Path, bin: &Path, current: &str) -> Result<String, String> 
     let key = result?;
     let tmp = bin.with_extension("new");
     fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    // Windows: a running exe cannot be overwritten but can be renamed; the old file is removed on the next run.
+    #[cfg(windows)]
+    {
+        let old = bin.with_extension("old");
+        let _ = fs::remove_file(&old);
+        if bin.exists() {
+            fs::rename(bin, &old).map_err(|e| e.to_string())?;
+        }
+    }
     fs::rename(&tmp, bin).map_err(|e| e.to_string())?;
     Ok(format!("updated {current} -> {} (signed with the {key} key)", offer.version))
 }
@@ -100,15 +129,25 @@ pub fn apply_command() -> i32 {
     let current = installed_version(Path::new(BIN)).unwrap_or_else(|| crate::VERSION.to_string());
     match apply(&crate::state::dir(), Path::new(BIN), &current) {
         Ok(msg) => {
-            eprintln!("cybercop-agent: {msg}");
-            let _ = std::process::Command::new("systemctl").args(["restart", "cybercop-agent"]).status();
+            crate::log(&msg);
+            restart_agent();
             0
         }
         Err(e) => {
-            eprintln!("cybercop-agent: update refused, staying on {current}: {e}");
+            crate::log(&format!("update refused, staying on {current}: {e}"));
             1
         }
     }
+}
+
+#[cfg(unix)]
+fn restart_agent() {
+    let _ = std::process::Command::new("systemctl").args(["restart", "cybercop-agent"]).status();
+}
+
+#[cfg(windows)]
+fn restart_agent() {
+    crate::win::service::restart();
 }
 
 fn installed_version(bin: &Path) -> Option<String> {
@@ -175,6 +214,7 @@ mod tests {
         let _ = fs::remove_dir_all(state.parent().unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_not_followed() {
         let k = SigningKey::from_bytes(&crate::release::tests::TEST_SECRET);
