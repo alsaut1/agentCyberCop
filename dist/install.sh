@@ -19,7 +19,7 @@ set -eu
 SERVER="https://agent.cybercop.gtva.net"
 # Oldest version this installer accepts: the version of the tag it was published with. An older signed version may
 # have known holes, so a control centre cannot push one to a new server.
-MIN_VERSION="0.1.1"
+MIN_VERSION="0.1.2"
 # Release keys, "name:base64-public-key" separated by spaces: main and spare (the maintainer keeps the secret halves
 # offline). Without keys nothing can be installed.
 RELEASE_KEYS="main:v1uiLKxvYbHr42+wVOqPtFOWNk/IxiElaVT1uGvRg+k= spare:ilfuIb2sW3tq5YJQDx9fLwRicTvrA+8j8VO498GVIuQ="
@@ -236,5 +236,8 @@ if [ ! -f "$STATE/agent.json" ]; then
   fi
 fi
 systemctl daemon-reload
-systemctl enable --now cybercop-agent cybercop-agent-update.path >/dev/null
+# restart, not just start: on a reinstall over a running agent the old process would keep running the old binary
+systemctl enable cybercop-agent cybercop-agent-update.path >/dev/null 2>&1
+systemctl restart cybercop-agent
+systemctl start cybercop-agent-update.path
 say "installed $VERSION; the first inventory appears in the control centre within a few minutes"
