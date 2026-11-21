@@ -1,6 +1,7 @@
 //! The inventory the agent sends: system, kernel, packages, services, listening ports, Docker images, site engines.
 //! Never file contents, databases, passwords, keys or traffic.
 
+pub mod addresses;
 pub mod docker;
 pub mod os;
 pub mod packages;
@@ -18,6 +19,7 @@ pub struct Inventory {
     pub agent_version: String,
     pub collected_at: u64,
     pub hostname: String,
+    pub addresses: Vec<String>,
     pub os: os::OsInfo,
     pub kernel: os::Kernel,
     pub packages: packages::Packages,
@@ -45,6 +47,7 @@ pub fn collect() -> Inventory {
         agent_version: crate::VERSION.to_string(),
         collected_at: now(),
         hostname: hostname(),
+        addresses: addresses::collect(),
         os: os::collect(),
         kernel: os::kernel(),
         packages,
