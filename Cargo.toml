@@ -11,3 +11,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[features]
+# Development build: also allows plain HTTP to localhost and (later) the test signing key. Never shipped.
+dev = []
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

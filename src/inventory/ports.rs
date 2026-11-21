@@ -1,5 +1,6 @@
-//! Listening sockets from /proc/net/{tcp,tcp6,udp,udp6}; the process name comes from /proc/<pid>/fd
-//! (needs the read-only capabilities the service is started with; without them the process is left empty).
+//! Listening sockets from /proc/net/{tcp,tcp6,udp,udp6} with the owning user. The process name is added only
+//! where /proc/<pid>/fd is readable without extra privileges: the agent deliberately has no CAP_SYS_PTRACE,
+//! which would allow more than reading.
 
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
@@ -11,6 +12,8 @@ pub struct Port {
     pub proto: String,
     pub address: String,
     pub port: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub process: String,
 }
@@ -31,8 +34,8 @@ fn addr(hex: &str, v6: bool) -> Option<String> {
     Some(Ipv6Addr::from(bytes).to_string())
 }
 
-/// → (address, port, inode) of listening sockets in one /proc/net table.
-pub fn parse_table(text: &str, v6: bool, udp: bool) -> Vec<(String, u16, u64)> {
+/// → (address, port, inode, uid) of listening sockets in one /proc/net table.
+pub fn parse_table(text: &str, v6: bool, udp: bool) -> Vec<(String, u16, u64, u32)> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -47,7 +50,7 @@ pub fn parse_table(text: &str, v6: bool, udp: bool) -> Vec<(String, u16, u64)> {
         }
         let Some((a, p)) = f[1].split_once(':') else { continue };
         let (Some(address), Ok(port)) = (addr(a, v6), u16::from_str_radix(p, 16)) else { continue };
-        out.push((address, port, f[9].parse().unwrap_or(0)));
+        out.push((address, port, f[9].parse().unwrap_or(0), f[7].parse().unwrap_or(u32::MAX)));
     }
     out
 }
@@ -74,14 +77,27 @@ fn socket_owners() -> HashMap<u64, String> {
     map
 }
 
+/// uid → user name from /etc/passwd.
+pub fn users() -> HashMap<u32, String> {
+    let text = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            Some((f.get(2)?.parse().ok()?, f.first()?.to_string()))
+        })
+        .collect()
+}
+
 pub fn collect() -> Vec<Port> {
     let owners = socket_owners();
+    let names = users();
     let mut set = BTreeSet::new();
     for (file, proto, v6, udp) in [("tcp", "tcp", false, false), ("tcp6", "tcp", true, false), ("udp", "udp", false, true), ("udp6", "udp", true, true)] {
         let Ok(text) = fs::read_to_string(format!("/proc/net/{file}")) else { continue };
-        for (address, port, inode) in parse_table(&text, v6, udp) {
+        for (address, port, inode, uid) in parse_table(&text, v6, udp) {
             let process = owners.get(&inode).cloned().unwrap_or_default();
-            set.insert(Port { proto: proto.into(), address, port, process });
+            let user = names.get(&uid).cloned().unwrap_or_else(|| if uid == u32::MAX { String::new() } else { uid.to_string() });
+            set.insert(Port { proto: proto.into(), address, port, user, process });
         }
     }
     set.into_iter().collect()
@@ -98,12 +114,12 @@ mod tests {
    1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 222 1\n\
    2: 020000C0:0016 640033C6:D431 01 00000000:00000000 00:00000000 00000000     0        0 333 1\n";
         let p = parse_table(t, false, false);
-        assert_eq!(p, vec![("0.0.0.0".into(), 22, 12345), ("127.0.0.1".into(), 8080, 222)]);
+        assert_eq!(p, vec![("0.0.0.0".into(), 22, 12345, 0), ("127.0.0.1".into(), 8080, 222, 0)]);
     }
 
     #[test]
     fn tcp6_any() {
         let t = "hdr\n   0: 00000000000000000000000000000000:0050 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 9 1\n";
-        assert_eq!(parse_table(t, true, false), vec![("::".into(), 80, 9)]);
+        assert_eq!(parse_table(t, true, false), vec![("::".into(), 80, 9, 0)]);
     }
 }
