@@ -38,6 +38,21 @@ pub fn run() -> i32 {
         crate::log(&format!("indicators not written: {e}"));
     }
 
+    // Password guessing: new log records since the last pass; the summary (and details when asked) for the service.
+    let now = inventory::now();
+    let mut auth = crate::win::auth::load();
+    crate::win::auth::poll(&mut auth, now);
+    crate::win::auth::save(&auth);
+    let details = crate::win::auth_request_file().exists();
+    let report = auth.counters.report("windows", now, details);
+    match write("auth.json", &serde_json::to_vec(&report).expect("json")) {
+        Ok(()) if details => {
+            let _ = fs::remove_file(crate::win::auth_request_file());
+        }
+        Ok(()) => {}
+        Err(e) => crate::log(&format!("auth summary not written: {e}")),
+    }
+
     let every = if cfg.inventory > 0 { cfg.inventory } else { 6 * 3600 };
     let inv_path = out_dir().join("inventory.json");
     let stamp = inventory::software_stamp();

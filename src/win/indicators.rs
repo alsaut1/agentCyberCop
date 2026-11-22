@@ -26,6 +26,8 @@ pub struct Indicators {
     pub tasks: Vec<Task>,
     pub services: Vec<ServiceEntry>,
     pub ports: Vec<Port>,
+    /// installed application compatibility databases (`sdbinst`)
+    pub sdbs: Vec<Sdb>,
     pub errors: Vec<String>,
 }
 
@@ -54,6 +56,46 @@ pub struct ServiceEntry {
     pub program: String,
     pub account: String,
     pub start: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct Sdb {
+    pub guid: String,
+    pub path: String,
+    pub description: String,
+    pub installed: u64,
+    pub sha256: String,
+    #[serde(flatten)]
+    pub content: crate::sdb::Content,
+}
+
+/// `AppCompatFlags\InstalledSDB\{guid}`: path, description, install time; the file read and parsed.
+pub fn sdbs(errors: &mut Vec<String>) -> Vec<Sdb> {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    let mut out = Vec::new();
+    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\InstalledSDB", KEY_READ | KEY_WOW64_64KEY)
+    else {
+        return out;
+    };
+    for guid in root.enum_keys().flatten() {
+        let Ok(k) = root.open_subkey_with_flags(&guid, KEY_READ) else { continue };
+        let path: String = k.get_value("DatabasePath").unwrap_or_default();
+        let description: String = k.get_value("DatabaseDescription").unwrap_or_default();
+        let ft: u64 = k.get_value("DatabaseInstallTimeStamp").unwrap_or(0);
+        let installed = (ft / 10_000_000).saturating_sub(11_644_473_600);
+        let (sha256, content) = match std::fs::read(&path) {
+            Ok(b) => (super::updates::sha256_hex(&b), crate::sdb::parse(&b)),
+            Err(e) => {
+                errors.push(format!("sdb {guid}: {e}"));
+                (String::new(), crate::sdb::Content { error: Some(e.to_string()), ..Default::default() })
+            }
+        };
+        out.push(Sdb { guid, path, description, installed, sha256, content });
+    }
+    out.sort_by(|a, b| a.guid.cmp(&b.guid));
+    out
 }
 
 fn administrators() -> Vec<String> {
@@ -156,7 +198,7 @@ pub fn parse_task(name: &str, xml: &str) -> Task {
 fn read_utf16(path: &Path) -> Option<String> {
     let b = std::fs::read(path).ok()?;
     if b.len() >= 2 && b[0] == 0xff && b[1] == 0xfe {
-        let w: Vec<u16> = b[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let w: Vec<u16> = b[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         return Some(String::from_utf16_lossy(&w));
     }
     Some(String::from_utf8_lossy(b.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&b)).into_owned())
@@ -204,6 +246,7 @@ pub fn collect() -> Indicators {
         tasks,
         services,
         ports: inventory::ports(&by_pid),
+        sdbs: sdbs(&mut errors),
         errors,
     }
 }

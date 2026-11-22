@@ -80,22 +80,29 @@ fn work(stop: Receiver<()>) -> i32 {
     crate::log(&format!("started, version {}", crate::VERSION));
     let heartbeat_every = if cfg.heartbeat > 0 { cfg.heartbeat } else { 300 };
     let (mut last_hb, mut retry_inv_at) = (0u64, 0u64);
-    let (mut sent_ind, mut sent_inv): (Option<SystemTime>, Option<SystemTime>) = (None, None);
+    let (mut sent_ind, mut sent_inv, mut sent_auth): (Option<SystemTime>, Option<SystemTime>, Option<SystemTime>) = (None, None, None);
     loop {
         let now = crate::win::inventory::now();
         if now.saturating_sub(last_hb) >= heartbeat_every {
             match daemon::heartbeat(&cfg, &key) {
-                Ok(inventory_now) => {
+                Ok(asked) => {
                     last_hb = now;
-                    if inventory_now {
+                    if asked.inventory {
                         crate::win::request_inventory();
+                    }
+                    if asked.auth_details {
+                        crate::win::request_auth_details();
                     }
                 }
                 Err(client::Error::Revoked) => return daemon::revoked(),
                 Err(e) => crate::log(&format!("heartbeat: {e}")),
             }
         }
-        for (file, path, sent) in [("indicators.json", "/agent-api/v1/indicators", &mut sent_ind), ("inventory.json", "/agent-api/v1/inventory", &mut sent_inv)] {
+        for (file, path, sent) in [
+            ("indicators.json", "/agent-api/v1/indicators", &mut sent_ind),
+            ("inventory.json", "/agent-api/v1/inventory", &mut sent_inv),
+            ("auth.json", "/agent-api/v1/auth", &mut sent_auth),
+        ] {
             let m = mtime(file);
             if m.is_none() || m == *sent || (file == "inventory.json" && now < retry_inv_at) {
                 continue;

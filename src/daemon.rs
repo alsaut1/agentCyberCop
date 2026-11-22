@@ -8,17 +8,27 @@ use crate::inventory;
 use std::time::Duration;
 
 pub const TICK: u64 = 30;
+#[cfg(unix)]
+const AUTH_POLL: u64 = 60;
 
-/// One heartbeat: tells the version and platform, takes an offered update (download and check only). → whether the
-/// client asked for a fresh inventory («Check now»).
-pub fn heartbeat(cfg: &state::Config, key: &ed25519_dalek::SigningKey) -> Result<bool, client::Error> {
+/// What the control centre asked for in its answer to a heartbeat.
+#[derive(Default)]
+pub struct Asked {
+    /// «Check now»: a fresh inventory.
+    pub inventory: bool,
+    /// The client asked for password guessing details.
+    pub auth_details: bool,
+}
+
+/// One heartbeat: tells the version and platform, takes an offered update (download and check only).
+pub fn heartbeat(cfg: &state::Config, key: &ed25519_dalek::SigningKey) -> Result<Asked, client::Error> {
     let body = serde_json::json!({"version": crate::VERSION, "arch": crate::update::ARCH}).to_string();
     let answer = client::signed(&cfg.server, &cfg.agent_id, key, "/agent-api/v1/heartbeat", body.as_bytes())?;
     if let Ok(offer) = serde_json::from_value::<crate::update::Offer>(answer["update"].clone())
         && let Err(e) = crate::update::fetch(&offer) {
             crate::log(&format!("update not taken: {e}"));
         }
-    Ok(answer["inventory_now"].as_bool() == Some(true))
+    Ok(Asked { inventory: answer["inventory_now"].as_bool() == Some(true), auth_details: answer["auth_details_now"].as_bool() == Some(true) })
 }
 
 #[cfg(unix)]
@@ -28,6 +38,10 @@ struct Timers {
     last_inventory: u64,
     db_stamp: u64,
     want_inventory: bool,
+    last_auth_poll: u64,
+    last_auth_sent: u64,
+    sent_events: usize,
+    want_auth_details: bool,
 }
 
 #[cfg(unix)]
@@ -46,16 +60,26 @@ pub fn run() -> i32 {
     let heartbeat_every = if cfg.heartbeat > 0 { cfg.heartbeat } else { 300 };
     let inventory_every = if cfg.inventory > 0 { cfg.inventory } else { 6 * 3600 };
     let indicators_every = if cfg.indicators > 0 { cfg.indicators } else { 900 };
-    let mut t = Timers { last_heartbeat: 0, last_indicators: 0, last_inventory: 0, db_stamp: 0, want_inventory: true };
+    let mut t = Timers {
+        last_heartbeat: 0,
+        last_indicators: 0,
+        last_inventory: 0,
+        db_stamp: 0,
+        want_inventory: true,
+        last_auth_poll: 0,
+        last_auth_sent: 0,
+        sent_events: 0,
+        want_auth_details: false,
+    };
+    let mut auth = crate::auth_linux::load();
     loop {
         let now = inventory::now();
         if now.saturating_sub(t.last_heartbeat) >= heartbeat_every {
             match heartbeat(&cfg, &key) {
-                Ok(inventory_now) => {
+                Ok(asked) => {
                     t.last_heartbeat = now;
-                    if inventory_now {
-                        t.want_inventory = true;
-                    }
+                    t.want_inventory |= asked.inventory;
+                    t.want_auth_details |= asked.auth_details;
                 }
                 Err(client::Error::Revoked) => return revoked(),
                 Err(e) => eprintln!("cybercop-agent: heartbeat: {e}"),
@@ -67,6 +91,31 @@ pub fn run() -> i32 {
                 Ok(_) => t.last_indicators = now,
                 Err(client::Error::Revoked) => return revoked(),
                 Err(e) => eprintln!("cybercop-agent: indicators: {e}"),
+            }
+        }
+        // Password guessing: read new log records every minute; send the summary every 15 minutes, at once when there
+        // is something to raise an alarm about, or when the client asked for details.
+        if now.saturating_sub(t.last_auth_poll) >= AUTH_POLL {
+            crate::auth_linux::poll(&mut auth, now);
+            crate::auth_linux::save(&auth);
+            t.last_auth_poll = now;
+        }
+        let new_events = auth.counters.events.len() != t.sent_events;
+        if now.saturating_sub(t.last_auth_sent) >= indicators_every || new_events || t.want_auth_details {
+            let report = auth.counters.report("linux", now, t.want_auth_details);
+            let body = serde_json::to_vec(&report).expect("json");
+            match client::signed(&cfg.server, &cfg.agent_id, &key, "/agent-api/v1/auth", &body) {
+                Ok(_) => {
+                    t.last_auth_sent = now;
+                    t.sent_events = auth.counters.events.len();
+                    t.want_auth_details = false;
+                }
+                Err(client::Error::Revoked) => return revoked(),
+                Err(e) => {
+                    eprintln!("cybercop-agent: auth summary: {e}");
+                    t.last_auth_sent = now.saturating_sub(indicators_every).saturating_add(300); // retry in ~5 min
+                    t.sent_events = auth.counters.events.len();
+                }
             }
         }
         let stamp = inventory::packages::db_stamp();

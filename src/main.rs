@@ -1,5 +1,8 @@
 //! cybercop-agent — the HT CYBERCOP server agent (Watcher). It only reads and reports; it changes nothing.
 
+mod auth;
+#[cfg(unix)]
+mod auth_linux;
 mod client;
 mod daemon;
 #[cfg(unix)]
@@ -7,6 +10,8 @@ mod indicators;
 #[cfg(unix)]
 mod inventory;
 mod release;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod sdb;
 mod state;
 mod update;
 #[cfg(windows)]
@@ -27,7 +32,7 @@ pub fn log(msg: &str) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cybercop-agent <command>\n\n  enroll [--server URL] CODE   register this server with a one-time code from the control centre\n  run                           work as a service\n  inventory                     print the inventory as JSON (nothing is sent)\n  indicators                    print the break-in indicators as JSON (nothing is sent)\n  version                       print the version"
+        "usage: cybercop-agent <command>\n\n  enroll [--server URL] CODE   register this server with a one-time code from the control centre\n  run                           work as a service\n  inventory                     print the inventory as JSON (nothing is sent)\n  indicators                    print the break-in indicators as JSON (nothing is sent)\n  auth [--details]              one pass over new SSH/RDP log records, print the password guessing summary (nothing is sent)\n  version                       print the version"
     );
     std::process::exit(2)
 }
@@ -109,6 +114,7 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&inventory::collect()).expect("json"));
             0
         }
+        Some("auth") => auth_once(args.get(2).map(String::as_str) == Some("--details")),
         Some("version") => {
             println!("cybercop-agent {VERSION}");
             0
@@ -116,4 +122,26 @@ fn main() {
         _ => usage(),
     };
     std::process::exit(code);
+}
+
+/// `cybercop-agent auth [--details]`: one pass over the new log records (the state folder keeps the position and the
+/// counters, as the agent does), then the summary it would send. For a manual check.
+fn auth_once(details: bool) -> i32 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    #[cfg(unix)]
+    let report = {
+        let mut s = auth_linux::load();
+        auth_linux::poll(&mut s, now);
+        auth_linux::save(&s);
+        s.counters.report("linux", now, details)
+    };
+    #[cfg(windows)]
+    let report = {
+        let mut s = win::auth::load();
+        win::auth::poll(&mut s, now);
+        win::auth::save(&s);
+        s.counters.report("windows", now, details)
+    };
+    println!("{}", serde_json::to_string_pretty(&report).expect("json"));
+    0
 }

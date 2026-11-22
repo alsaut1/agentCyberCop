@@ -30,6 +30,17 @@ Windows:
 Both: the path of the agent's own file and its SHA-256, so the control centre can tell the agent's own user,
 service and task (the installer created them, the file matches a signed release) from look-alikes.
 
+Windows also: installed application compatibility databases (`sdbinst`): GUID, path, SHA-256 and what is inside —
+which programs they apply to, which shims, whether they make programs load other code.
+
+Password guessing (SSH on Linux; RDP and SSH on Windows): the agent reads only the new log records since its last pass
+(the systemd journal or `/var/log/auth.log`/`/var/log/secure`; on Windows the Security, RDP and OpenSSH event logs),
+keeps counters — not log lines — for 48 hours and every 15 minutes sends a summary: per service, attempts, the number
+of distinct addresses and user names, logins after a series of failures, locked accounts. Addresses with 10 or more
+failures within an hour, and no successful login from them, are sent for the shared list of attacking addresses.
+Addresses with counts and the user names tried are sent only when the server's owner asks for them in the control
+centre. Measured cost of a pass on a small server: 11–30 ms of processor time, no disk reads, about 2 KB of state.
+
 ## What it never collects
 
 File contents, databases, passwords, private keys, traffic.

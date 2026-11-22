@@ -6,6 +6,7 @@
 //!   checked update, collects what needs privileges (Windows Update, owners of listening ports, all scheduled tasks)
 //!   and writes the inventory and the break-in indicators to `out\` in the state folder. It never uses the network.
 
+pub mod auth;
 pub mod indicators;
 pub mod inventory;
 pub mod service;
@@ -28,6 +29,15 @@ pub fn request_file() -> PathBuf {
 
 pub fn request_inventory() {
     let _ = std::fs::write(request_file(), b"1");
+}
+
+/// The service asks the SYSTEM task for password guessing details (the client pressed the button).
+pub fn auth_request_file() -> PathBuf {
+    crate::state::dir().join("request-auth-details")
+}
+
+pub fn request_auth_details() {
+    let _ = std::fs::write(auth_request_file(), b"1");
 }
 
 const LOG_MAX: u64 = 1024 * 1024;

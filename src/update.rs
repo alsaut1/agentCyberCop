@@ -71,6 +71,10 @@ pub fn agent_self() -> AgentSelf {
     AgentSelf { path: BIN, sha256: fs::read(BIN).map(|d| hex(&d)).unwrap_or_default() }
 }
 
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex(data)
+}
+
 fn hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
