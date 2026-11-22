@@ -13,7 +13,8 @@ Linux:
   against the security advisories of the distribution itself (with [Trivy](https://github.com/aquasecurity/trivy));
 - running services, listening ports, Docker images (only if the agent user is added to the `docker` group);
 - versions of site engines (WordPress with plugins, Joomla, Drupal);
-- signs of a break-in: new users, new SSH keys (fingerprints only), new scheduled tasks, new listening ports.
+- signs of a break-in: new users (name, uid, home folder, shell), new SSH keys (fingerprint and the `authorized_keys`
+  file, never the key itself or its comment), new scheduled tasks, new listening ports.
 
 Windows:
 
@@ -24,7 +25,10 @@ Windows:
   vulnerabilities each update fixes in Microsoft's Security Update Guide. For third-party programs only the list is
   kept;
 - signs of a break-in: new users (and who is an administrator), new Task Scheduler tasks, new services, new
-  listening ports. Tasks as name, program file and a hash of the action, never the full command line.
+  listening ports. Tasks as name, program path and a hash of the action, never the arguments.
+
+Both: the path of the agent's own file and its SHA-256, so the control centre can tell the agent's own user,
+service and task (the installer created them, the file matches a signed release) from look-alikes.
 
 ## What it never collects
 

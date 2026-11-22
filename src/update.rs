@@ -59,6 +59,18 @@ pub struct Offer {
     pub signature: String,
 }
 
+/// The agent file the installer put in place and its sha256: the control centre checks it against the signed
+/// releases to tell the agent's own user, service and task from look-alikes.
+#[derive(Serialize, Debug)]
+pub struct AgentSelf {
+    pub path: &'static str,
+    pub sha256: String,
+}
+
+pub fn agent_self() -> AgentSelf {
+    AgentSelf { path: BIN, sha256: fs::read(BIN).map(|d| hex(&d)).unwrap_or_default() }
+}
+
 fn hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }

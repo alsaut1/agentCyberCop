@@ -16,6 +16,7 @@ use std::path::Path;
 pub struct Indicators {
     pub schema: u32,
     pub collected_at: u64,
+    pub agent: crate::update::AgentSelf,
     pub users: Vec<User>,
     pub ssh_keys: Vec<SshKey>,
     pub cron: Vec<CronEntry>,
@@ -27,12 +28,15 @@ pub struct Indicators {
 pub struct User {
     pub name: String,
     pub uid: u32,
+    pub home: String,
     pub shell: String,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
 pub struct SshKey {
     pub user: String,
+    /// The authorized_keys file: users sharing a home (root and operator on RHEL) share the same keys.
+    pub file: String,
     pub kind: String,
     pub fingerprint: String,
 }
@@ -49,7 +53,7 @@ pub fn parse_passwd(text: &str) -> Vec<User> {
     text.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split(':').collect();
-            (f.len() >= 7).then(|| User { name: f[0].into(), uid: f[2].parse().unwrap_or(u32::MAX), shell: f[6].into() })
+            (f.len() >= 7).then(|| User { name: f[0].into(), uid: f[2].parse().unwrap_or(u32::MAX), home: f[5].into(), shell: f[6].into() })
         })
         .collect()
 }
@@ -84,7 +88,7 @@ fn ssh_keys(users: &[User], passwd: &str) -> Vec<SshKey> {
             let Ok(text) = fs::read_to_string(&path) else { continue };
             for line in text.lines() {
                 if let Some((kind, fingerprint)) = key_fingerprint(line) {
-                    out.push(SshKey { user: f[0].into(), kind, fingerprint });
+                    out.push(SshKey { user: f[0].into(), file: path.display().to_string(), kind, fingerprint });
                 }
             }
         }
@@ -170,6 +174,7 @@ pub fn collect() -> Indicators {
     Indicators {
         schema: 1,
         collected_at: crate::inventory::now(),
+        agent: crate::update::agent_self(),
         users,
         ssh_keys: keys,
         cron: cron(),
@@ -185,7 +190,7 @@ mod tests {
     #[test]
     fn passwd() {
         let u = parse_passwd("root:x:0:0:root:/root:/bin/bash\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\n");
-        assert_eq!(u[0], User { name: "root".into(), uid: 0, shell: "/bin/bash".into() });
+        assert_eq!(u[0], User { name: "root".into(), uid: 0, home: "/root".into(), shell: "/bin/bash".into() });
     }
 
     #[test]

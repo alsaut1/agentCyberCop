@@ -21,6 +21,7 @@ pub struct Indicators {
     pub schema: u32,
     pub platform: &'static str,
     pub collected_at: u64,
+    pub agent: crate::update::AgentSelf,
     pub users: Vec<User>,
     pub tasks: Vec<Task>,
     pub services: Vec<ServiceEntry>,
@@ -41,7 +42,7 @@ pub struct Task {
     pub name: String,
     pub user: String,
     pub enabled: bool,
-    /// Program file name only.
+    /// Program path as written in the task (no arguments), or `COM {class}`.
     pub program: String,
     /// Hash of all actions (program, arguments, COM handlers): changes when the task is changed.
     pub id: String,
@@ -143,7 +144,7 @@ pub fn parse_task(name: &str, xml: &str) -> Task {
     let actions = xml.find("<Actions").and_then(|i| xml[i..].find("</Actions>").map(|j| &xml[i..i + j])).unwrap_or("");
     let program = tag(actions, "Command")
         .first()
-        .map(|c| unescape(c).trim_matches('"').rsplit(['\\', '/']).next().unwrap_or_default().to_string())
+        .map(|c| unescape(c).trim().trim_matches('"').to_string())
         .or_else(|| tag(actions, "ClassId").first().map(|c| format!("COM {c}")))
         .unwrap_or_default();
     let user = tag(xml, "UserId").first().map(|u| unescape(u)).or_else(|| tag(xml, "GroupId").first().map(|g| unescape(g))).unwrap_or_default();
@@ -198,6 +199,7 @@ pub fn collect() -> Indicators {
         schema: SCHEMA,
         platform: "windows",
         collected_at: inventory::now(),
+        agent: crate::update::agent_self(),
         users,
         tasks,
         services,
@@ -214,7 +216,7 @@ mod tests {
     fn task_without_the_command_line() {
         let xml = r#"<?xml version="1.0" encoding="UTF-16"?><Task><Principals><Principal id="Author"><UserId>S-1-5-18</UserId></Principal></Principals><Settings><Enabled>false</Enabled></Settings><Actions Context="Author"><Exec><Command>"C:\Tools\backup.exe"</Command><Arguments>--password s3cret</Arguments></Exec></Actions></Task>"#;
         let t = parse_task(r"\Backup", xml);
-        assert_eq!(t.program, "backup.exe");
+        assert_eq!(t.program, r"C:\Tools\backup.exe");
         assert_eq!(t.user, "S-1-5-18");
         assert!(!t.enabled);
         assert!(!format!("{t:?}").contains("s3cret"));
