@@ -7,6 +7,9 @@
 //! - Security 4624 (logon), types 10 and 3 with an address: a login after a series of failures;
 //! - Security 4740: a locked account;
 //! - OpenSSH/Operational: the same lines as sshd on Linux.
+//!
+//! Once, on the first start of this version, the successful logins of the last 90 days still in these logs fill the
+//! known networks (see `auth`); the Security log keeps as much as its size allows.
 
 use crate::auth::{self, Counters, Seen};
 use crate::state;
@@ -20,6 +23,7 @@ use windows::core::PCWSTR;
 
 const STATE: &str = "auth-state.json";
 const MAX_EVENTS: usize = 50_000; // per log and pass
+const MAX_SEED: usize = 1_000_000; // per log, once
 const SECURITY: &str = "Security";
 const RDP: &str = "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational";
 const SSH: &str = "OpenSSH/Operational";
@@ -32,6 +36,9 @@ pub struct State {
     /// addresses from the RDP log in the last two hours (its record and the Security one may come in different passes)
     #[serde(default)]
     rdp_ips: BTreeMap<String, u64>,
+    /// the old records were read once for the known networks
+    #[serde(default)]
+    seeded: bool,
     #[serde(default)]
     pub counters: Counters,
 }
@@ -64,11 +71,18 @@ fn render(h: EVT_HANDLE) -> Option<String> {
 /// Records of a log matching an XPath query, as XML, oldest first (or only the newest one).
 fn query(log: &str, xpath: &str, newest_only: bool) -> Vec<String> {
     let mut out = Vec::new();
+    each(log, xpath, newest_only, MAX_EVENTS, |x| out.push(x));
+    out
+}
+
+/// Each record of a log matching an XPath query, as XML, oldest first (or only the newest one), at most `max`.
+fn each(log: &str, xpath: &str, newest_only: bool, max: usize, mut f: impl FnMut(String)) {
+    let mut n = 0usize;
     let path = super::sys::wide(log);
     let q = super::sys::wide(xpath);
     let flags = EvtQueryChannelPath.0 | if newest_only { EvtQueryReverseDirection.0 } else { EvtQueryForwardDirection.0 };
     unsafe {
-        let Ok(h) = EvtQuery(None, PCWSTR(path.as_ptr()), PCWSTR(q.as_ptr()), flags) else { return out };
+        let Ok(h) = EvtQuery(None, PCWSTR(path.as_ptr()), PCWSTR(q.as_ptr()), flags) else { return };
         let mut batch = [0isize; 256];
         loop {
             let mut got = 0u32;
@@ -78,17 +92,17 @@ fn query(log: &str, xpath: &str, newest_only: bool) -> Vec<String> {
             for raw in &batch[..got as usize] {
                 let e = EVT_HANDLE(*raw);
                 if let Some(x) = render(e) {
-                    out.push(x);
+                    f(x);
+                    n += 1;
                 }
                 let _ = EvtClose(e);
             }
-            if newest_only || out.len() >= MAX_EVENTS {
+            if newest_only || n >= max {
                 break;
             }
         }
         let _ = EvtClose(h);
     }
-    out
 }
 
 /// `<Name>value</Name>` inside the System part, or `<Data Name='Name'>value</Data>`.
@@ -108,15 +122,7 @@ pub fn time(xml: &str) -> Option<u64> {
     let i = xml.find("SystemTime='")? + 12;
     let t = &xml[i..i + 19];
     let n = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, s) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
-    // days from civil (Howard Hinnant)
-    let y2 = if mo <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + s).ok()
+    crate::auth::civil(n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?)
 }
 
 /// "203.0.113.5:50744" or "[2001:db8::1]:50744" → the address.
@@ -192,15 +198,19 @@ pub fn poll(s: &mut State, now: u64) {
                 }
                 let service = if ltype == "10" || rdp_ips.contains(ip) { "rdp" } else { "windows_network" };
                 let seen = if id == "4625" {
-                    Seen::Failure { service, ip: ip.into(), user }
+                    Seen::Failure { service, proto: "", ip: ip.into(), user }
                 } else {
-                    Seen::Success { service, ip: ip.into(), user }
+                    Seen::Success { service, proto: "", ip: ip.into(), user }
                 };
                 s.counters.add(seen, at);
             }
             "4740" => s.counters.add(Seen::Lockout { service: "windows", user }, at),
             _ => {}
         }
+    }
+    if !s.seeded {
+        seed(&mut s.counters, now);
+        s.seeded = true;
     }
     for x in new_records(s, SSH, &[("", "")]) {
         if let Some(msg) = field(&x, "payload")
@@ -210,6 +220,36 @@ pub fn poll(s: &mut State, now: u64) {
         }
     }
     s.counters.prune(now);
+}
+
+/// Read the old records once: successful logins of the last 90 days → known networks. Failures are not counted.
+fn seed(c: &mut Counters, now: u64) {
+    let window = format!("TimeCreated[timediff(@SystemTime) <= {}]", auth::KNOWN_KEEP * 1000);
+    let mut rdp_ips = BTreeSet::new();
+    each(RDP, &format!("*[System[(EventID=131 or EventID=140) and {window}]]"), false, MAX_SEED, |x| {
+        if let Some(ip) = field(&x, "IPString").map(String::from).or_else(|| field(&x, "ClientIP").map(strip_port)).filter(|ip| remote(ip)) {
+            rdp_ips.insert(ip);
+        }
+    });
+    let xpath = format!(
+        "*[System[EventID=4624 and {window}] and EventData[Data[@Name='LogonType']='10' or Data[@Name='LogonType']='3']]"
+    );
+    each(SECURITY, &xpath, false, MAX_SEED, |x| {
+        let ip = field(&x, "IpAddress").unwrap_or("");
+        let ltype = field(&x, "LogonType").unwrap_or("");
+        if remote(ip) {
+            let service = if ltype == "10" || rdp_ips.contains(ip) { "rdp" } else { "windows_network" };
+            let user: String = field(&x, "TargetUserName").unwrap_or("").chars().take(64).collect();
+            c.learn(service, &user, ip, time(&x).unwrap_or(now));
+        }
+    });
+    each(SSH, &format!("*[System[{window}]]"), false, MAX_SEED, |x| {
+        if let Some(msg) = field(&x, "payload")
+            && let Some(Seen::Success { service, ip, user, .. }) = auth::parse_sshd(msg)
+        {
+            c.learn(service, &user, &ip, time(&x).unwrap_or(now));
+        }
+    });
 }
 
 #[cfg(test)]

@@ -33,13 +33,25 @@ service and task (the installer created them, the file matches a signed release)
 Windows also: installed application compatibility databases (`sdbinst`): GUID, path, SHA-256 and what is inside —
 which programs they apply to, which shims, whether they make programs load other code.
 
-Password guessing (SSH on Linux; RDP and SSH on Windows): the agent reads only the new log records since its last pass
-(the systemd journal or `/var/log/auth.log`/`/var/log/secure`; on Windows the Security, RDP and OpenSSH event logs),
-keeps counters — not log lines — for 48 hours and every 15 minutes sends a summary: per service, attempts, the number
-of distinct addresses and user names, logins after a series of failures, locked accounts. Addresses with 10 or more
-failures within an hour, and no successful login from them, are sent for the shared list of attacking addresses.
-Addresses with counts and the user names tried are sent only when the server's owner asks for them in the control
-centre. Measured cost of a pass on a small server: 11–30 ms of processor time, no disk reads, about 2 KB of state.
+Password guessing (on Linux SSH, mail — Postfix, Dovecot, Exim — and FTP — vsftpd, ProFTPD, Pure-FTPd; on Windows
+RDP and SSH): the agent reads only the new log records since its last pass (the systemd journal, or the syslog files;
+the servers' own logs — Exim's main log, ProFTPD's and vsftpd's logs — and wtmp for ProFTPD's logins; on Windows the
+Security, RDP and OpenSSH event logs), keeps counters — not log lines — for 48 hours and every 15 minutes sends a
+summary: per service, attempts, the number of distinct addresses and user names, logins after a series of failures,
+locked accounts. A login after a series of failures counts only from a network (IPv4 /24, IPv6 /64) the account has
+not logged in from within 90 days; these networks stay on the server, in the agent's state folder. To know them from
+the start, on its first start the agent reads once the old logs still on the server (rotated and `.gz` ones too) for
+successful logins only. Addresses with 10 or more failures within an hour, and no successful login from them, are
+sent for the shared list of attacking addresses. Addresses with counts and the user names tried (for mail, sending
+and receiving apart) are sent only when the server's owner asks for them in the control centre. A server that is not
+installed costs nothing: its files do not exist and the journal filter does not match.
+
+vsftpd with its default settings on Red Hat-like systems writes no line of its own about logins, and in the PAM line
+it writes the client's host name instead of its address when the address has one; such attempts cannot be counted by
+address. With `dual_log_enable=YES` (or `xferlog_std_format=NO`) vsftpd writes its own log with addresses and logins.
+
+Measured cost on small servers: a pass 11–30 ms of processor time, no disk reads, 2–3 KB of state; the one-time
+reading of old logs about 0.5 s for a few MB, and about 2 s of wall time for 3 million lines (320 MB of text).
 
 ## What it never collects
 

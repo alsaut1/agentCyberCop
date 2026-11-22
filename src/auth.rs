@@ -1,8 +1,13 @@
-//! Password guessing (RDP and SSH): the agent reads only the new log records since its last pass, keeps counters
-//! (not the log) for 48 hours and sends a summary: per service and 15-minute window — attempts, distinct addresses,
-//! distinct user names, logins after a series of failures, locked accounts. Details (addresses with counts, and the
-//! user names tried) go only when the client asks for them in the control centre. Addresses with 10 or more failures
-//! within an hour, and no successful login from them, are sent separately for the shared list of attacking addresses.
+//! Password guessing (SSH, RDP, mail, FTP): the agent reads only the new log records since its last pass, keeps
+//! counters (not the log) for 48 hours and sends a summary: per service and 15-minute window — attempts, distinct
+//! addresses, distinct user names, logins after a series of failures, locked accounts. Details (addresses with counts,
+//! the user names tried, for mail sending and receiving apart) go only when the client asks for them in the control
+//! centre. Addresses with 10 or more failures within an hour, and no successful login from them, are sent separately
+//! for the shared list of attacking addresses.
+//!
+//! A login after a series of failures is reported only when it comes from a network this account has not logged in
+//! from before (IPv4 /24, IPv6 /64) within 90 days: a mail client with an old password that keeps retrying and then
+//! logs in from its usual network is not a break-in. The known networks stay on the server, in the state folder.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,12 +20,15 @@ const ATTACKER: u32 = 10; // failures within an hour → the address goes to the
 const MAX_IPS: usize = 20_000;
 const MAX_USERS_PER_IP: usize = 30;
 const MAX_SET: usize = 5_000;
+pub const KNOWN_KEEP: u64 = 90 * 86_400; // a network stays known for 90 days after the last login from it
+const MAX_KNOWN: usize = 50_000;
 
 /// One thing seen in a log.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Seen {
-    Failure { service: &'static str, ip: String, user: String },
-    Success { service: &'static str, ip: String, user: String },
+    /// `proto` — for mail: smtp (sending), imap, pop3 (receiving); empty for the other services
+    Failure { service: &'static str, proto: &'static str, ip: String, user: String },
+    Success { service: &'static str, proto: &'static str, ip: String, user: String },
     Lockout { service: &'static str, user: String },
 }
 
@@ -31,7 +39,7 @@ pub fn parse_sshd(msg: &str) -> Option<Seen> {
     let msg = msg.trim();
     if let Some(rest) = msg.strip_prefix("Invalid user ") {
         let (user, ip) = user_from(rest)?;
-        return Some(Seen::Failure { service: "ssh", ip, user });
+        return Some(Seen::Failure { service: "ssh", proto: "", ip, user });
     }
     for prefix in ["Failed password for ", "Failed keyboard-interactive/pam for ", "Failed none for "] {
         if let Some(rest) = msg.strip_prefix(prefix) {
@@ -39,13 +47,13 @@ pub fn parse_sshd(msg: &str) -> Option<Seen> {
                 return None; // already counted by its "Invalid user" line
             }
             let (user, ip) = user_from(rest)?;
-            return Some(Seen::Failure { service: "ssh", ip, user });
+            return Some(Seen::Failure { service: "ssh", proto: "", ip, user });
         }
     }
     if let Some(rest) = msg.strip_prefix("Accepted ") {
         let rest = rest.split_once(" for ")?.1;
         let (user, ip) = user_from(rest)?;
-        return Some(Seen::Success { service: "ssh", ip, user });
+        return Some(Seen::Success { service: "ssh", proto: "", ip, user });
     }
     if msg.contains("pam_faillock(") && msg.contains("account temporarily locked") {
         let user = msg.split("for user ").nth(1)?.split_whitespace().next()?.to_string();
@@ -59,8 +67,49 @@ fn user_from(rest: &str) -> Option<(String, String)> {
     let i = rest.rfind(" from ")?;
     let user = rest[..i].trim().to_string();
     let ip = rest[i + 6..].split_whitespace().next()?.to_string();
-    ip.parse::<std::net::IpAddr>().ok()?;
-    Some((user.chars().take(64).collect(), ip))
+    Some((user.chars().take(64).collect(), address(&ip)?))
+}
+
+/// An address as text → its usual form (an IPv4 address inside IPv6, «::ffff:203.0.113.5», becomes IPv4), or None.
+pub fn address(s: &str) -> Option<String> {
+    let ip: std::net::IpAddr = s.trim().parse().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_else(|| v6.to_string()),
+        v4 => v4.to_string(),
+    })
+}
+
+/// The network remembered for an address: IPv4 /24, IPv6 /64.
+pub fn network(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => {
+            let o = a.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        Ok(std::net::IpAddr::V6(a)) => {
+            let s = a.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Err(_) => ip.to_string(),
+    }
+}
+
+/// Civil date and time (UTC) → Unix seconds (days from civil, Howard Hinnant).
+pub fn civil(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<u64> {
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + s).ok()
+}
+
+fn known_key(service: &str, user: &str, ip: &str) -> String {
+    format!("{service}\x1f{}\x1f{}", user.to_lowercase(), network(ip))
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -82,6 +131,19 @@ pub struct Ip {
     pub hours: BTreeMap<u64, u32>,
     pub users: BTreeMap<String, u64>,
     pub success: u64, // last successful login from this address
+    /// mail: failures per protocol (smtp, imap, pop3)
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub protos: BTreeMap<String, u64>,
+    /// failures per service (one address may try several); `service` is the first one seen
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, u64>,
+}
+
+impl Ip {
+    /// The service with the most failures from this address.
+    pub fn main_service(&self) -> String {
+        self.services.iter().max_by_key(|(_, n)| **n).map(|(s, _)| s.clone()).unwrap_or_else(|| self.service.clone())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -94,6 +156,9 @@ pub struct Event {
     pub user: String,
     pub at: u64,
     pub failures: u32,
+    /// the network of a login after a series of failures (not known for this account)
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub net: String,
 }
 
 /// Counters kept on the server between passes (state folder). No log lines.
@@ -103,6 +168,9 @@ pub struct Counters {
     pub windows: BTreeMap<u64, BTreeMap<String, Win>>,
     pub ips: BTreeMap<String, Ip>,
     pub events: Vec<Event>,
+    /// service, account and network of a successful login → its time (90 days)
+    #[serde(default)]
+    pub known: BTreeMap<String, u64>,
 }
 
 impl Counters {
@@ -110,7 +178,7 @@ impl Counters {
         let start = at - at % WINDOW;
         let hour = at - at % HOUR;
         match seen {
-            Seen::Failure { service, ip, user } => {
+            Seen::Failure { service, proto, ip, user } => {
                 let w = self.windows.entry(start).or_default().entry(service.into()).or_default();
                 w.attempts += 1;
                 if w.ips.len() < MAX_SET {
@@ -127,8 +195,12 @@ impl Counters {
                 if e.users.len() < MAX_USERS_PER_IP || e.users.contains_key(&user) {
                     *e.users.entry(user).or_default() += 1;
                 }
+                if !proto.is_empty() {
+                    *e.protos.entry(proto.into()).or_default() += 1;
+                }
+                *e.services.entry(service.into()).or_default() += 1;
             }
-            Seen::Success { service, ip, user } => {
+            Seen::Success { service, ip, user, .. } => {
                 let failures: u32 = self
                     .ips
                     .get(&ip)
@@ -140,10 +212,13 @@ impl Counters {
                         e.hours.clear(); // the series is reported; the next login needs a new series to alarm again
                     }
                 }
-                if failures >= SERIES {
+                let key = known_key(service, &user, &ip);
+                let known = self.known.get(&key).is_some_and(|t| t + KNOWN_KEEP >= at);
+                if failures >= SERIES && !known {
                     self.windows.entry(start).or_default().entry(service.into()).or_default().success_after += 1;
                     self.event("success_after", service, &ip, &user, at, failures);
                 }
+                self.learn(service, &user, &ip, at);
             }
             Seen::Lockout { service, user } => {
                 self.windows.entry(start).or_default().entry(service.into()).or_default().lockouts += 1;
@@ -152,10 +227,26 @@ impl Counters {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The same thing seen `n` times (Dovecot writes «auth failed, 3 attempts» once per connection).
+    pub fn add_n(&mut self, seen: Seen, at: u64, n: u32) {
+        for _ in 1..n.clamp(1, 100) {
+            self.add(seen.clone(), at);
+        }
+        self.add(seen, at);
+    }
+
+    /// Remember a successful login (also from the old logs read once on the first start).
+    pub fn learn(&mut self, service: &str, user: &str, ip: &str, at: u64) {
+        let t = self.known.entry(known_key(service, user, ip)).or_default();
+        *t = (*t).max(at);
+    }
+
     fn event(&mut self, kind: &str, service: &str, ip: &str, user: &str, at: u64, failures: u32) {
         let id = crate::update::sha256_hex(format!("{kind}\x1f{service}\x1f{ip}\x1f{user}\x1f{at}").as_bytes())[..16].to_string();
         if !self.events.iter().any(|e| e.id == id) {
-            self.events.push(Event { id, kind: kind.into(), service: service.into(), ip: ip.into(), user: user.into(), at, failures });
+            let net = if ip.is_empty() { String::new() } else { network(ip) };
+            self.events.push(Event { id, kind: kind.into(), service: service.into(), ip: ip.into(), user: user.into(), at, failures, net });
         }
     }
 
@@ -167,6 +258,14 @@ impl Counters {
         self.ips.retain(|_, e| e.last >= edge || e.success >= edge);
         for e in self.ips.values_mut() {
             e.hours.retain(|h, _| *h >= edge);
+        }
+        self.known.retain(|_, t| *t + KNOWN_KEEP >= now);
+        if self.known.len() > MAX_KNOWN {
+            let mut by_time: Vec<(u64, String)> = self.known.iter().map(|(k, t)| (*t, k.clone())).collect();
+            by_time.sort();
+            for (_, k) in by_time.into_iter().take(self.known.len() - MAX_KNOWN) {
+                self.known.remove(&k);
+            }
         }
         if self.ips.len() > MAX_IPS {
             let mut by_last: Vec<(u64, String)> = self.ips.iter().map(|(k, e)| (e.last, k.clone())).collect();
@@ -198,7 +297,7 @@ impl Counters {
             .ips
             .iter()
             .filter(|(_, e)| e.last >= since && e.success == 0 && e.hours.values().any(|n| *n >= ATTACKER))
-            .map(|(ip, e)| Attacker { ip: ip.clone(), service: e.service.clone(), attempts: e.attempts, last: e.last })
+            .map(|(ip, e)| Attacker { ip: ip.clone(), service: e.main_service(), attempts: e.attempts, last: e.last })
             .collect();
         let events = self.events.iter().filter(|e| e.at + 24 * HOUR >= now).cloned().collect();
         Report {
@@ -220,11 +319,27 @@ impl Counters {
             .map(|(ip, e)| {
                 let mut users: Vec<(String, u64)> = e.users.iter().map(|(u, n)| (u.clone(), *n)).collect();
                 users.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-                IpOut { ip: ip.clone(), service: e.service.clone(), attempts: e.attempts, first: e.first, last: e.last, success: e.success, users }
+                IpOut {
+                    ip: ip.clone(),
+                    service: e.main_service(),
+                    services: e.services.clone(),
+                    attempts: e.attempts,
+                    first: e.first,
+                    last: e.last,
+                    success: e.success,
+                    users,
+                    protos: e.protos.clone(),
+                }
             })
             .collect();
         ips.sort_by(|a, b| b.attempts.cmp(&a.attempts).then(a.ip.cmp(&b.ip)));
         ips.truncate(200);
+        let mut protos: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        for e in self.ips.values() {
+            for (p, n) in &e.protos {
+                *protos.entry("mail".into()).or_default().entry(p.clone()).or_default() += n; // only mail has protocols
+            }
+        }
         let mut by_user: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
         for (ip, e) in &self.ips {
             for (u, n) in &e.users {
@@ -237,7 +352,7 @@ impl Counters {
             by_user.into_iter().map(|(name, (attempts, ips))| UserOut { name, attempts, ips: ips.len() as u64 }).collect();
         users.sort_by(|a, b| b.attempts.cmp(&a.attempts).then(a.name.cmp(&b.name)));
         users.truncate(200);
-        Details { generated_at: now, since: now.saturating_sub(KEEP), ips, users }
+        Details { generated_at: now, since: now.saturating_sub(KEEP), ips, users, protos }
     }
 }
 
@@ -269,6 +384,10 @@ pub struct IpOut {
     pub last: u64,
     pub success: u64,
     pub users: Vec<(String, u64)>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub protos: BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, u64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -284,6 +403,9 @@ pub struct Details {
     pub since: u64,
     pub ips: Vec<IpOut>,
     pub users: Vec<UserOut>,
+    /// service → protocol → failures (mail: smtp is sending, imap and pop3 receiving)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub protos: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -306,16 +428,16 @@ mod tests {
     fn sshd_lines() {
         assert_eq!(
             parse_sshd("Invalid user admin from 203.0.113.5 port 51234"),
-            Some(Seen::Failure { service: "ssh", ip: "203.0.113.5".into(), user: "admin".into() })
+            Some(Seen::Failure { service: "ssh", proto: "", ip: "203.0.113.5".into(), user: "admin".into() })
         );
         assert_eq!(parse_sshd("Failed password for invalid user admin from 203.0.113.5 port 51234 ssh2"), None);
         assert_eq!(
             parse_sshd("Failed password for root from 2001:db8::7 port 4022 ssh2"),
-            Some(Seen::Failure { service: "ssh", ip: "2001:db8::7".into(), user: "root".into() })
+            Some(Seen::Failure { service: "ssh", proto: "", ip: "2001:db8::7".into(), user: "root".into() })
         );
         assert_eq!(
             parse_sshd("Accepted publickey for admin from 198.51.100.20 port 49790 ssh2: ED25519 SHA256:x"),
-            Some(Seen::Success { service: "ssh", ip: "198.51.100.20".into(), user: "admin".into() })
+            Some(Seen::Success { service: "ssh", proto: "", ip: "198.51.100.20".into(), user: "admin".into() })
         );
         assert_eq!(
             parse_sshd("pam_faillock(sshd:auth): Consecutive login failures for user bob account temporarily locked"),
@@ -323,7 +445,7 @@ mod tests {
         );
         assert_eq!(parse_sshd("Failed publickey for root from 203.0.113.5 port 1 ssh2: RSA SHA256:x"), None);
         assert_eq!(parse_sshd("Connection closed by 203.0.113.5 port 1 [preauth]"), None);
-        assert_eq!(parse_sshd("Invalid user  from 203.0.113.5 port 1"), Some(Seen::Failure { service: "ssh", ip: "203.0.113.5".into(), user: "".into() }));
+        assert_eq!(parse_sshd("Invalid user  from 203.0.113.5 port 1"), Some(Seen::Failure { service: "ssh", proto: "", ip: "203.0.113.5".into(), user: "".into() }));
     }
 
     #[test]
@@ -331,21 +453,21 @@ mod tests {
         let mut c = Counters::default();
         let t = 1_800_000_000;
         for i in 0..12 {
-            c.add(Seen::Failure { service: "ssh", ip: "203.0.113.5".into(), user: format!("u{}", i % 3) }, t + i);
+            c.add(Seen::Failure { service: "ssh", proto: "", ip: "203.0.113.5".into(), user: format!("u{}", i % 3) }, t + i);
         }
         for i in 0..4 {
-            c.add(Seen::Failure { service: "ssh", ip: "198.51.100.1".into(), user: "alex".into() }, t + i);
+            c.add(Seen::Failure { service: "ssh", proto: "", ip: "198.51.100.1".into(), user: "jana".into() }, t + i);
         }
-        c.add(Seen::Success { service: "ssh", ip: "198.51.100.1".into(), user: "alex".into() }, t + 30);
+        c.add(Seen::Success { service: "ssh", proto: "", ip: "198.51.100.1".into(), user: "jana".into() }, t + 30);
         assert!(c.events.is_empty()); // 4 mistakes and a login — not a series
         let r = c.report("linux", t + 60, false);
         assert_eq!(r.attackers.len(), 1); // 12 within the hour; the one who logged in is never sent
         assert_eq!(r.windows[0].attempts, 16);
         assert_eq!(r.windows[0].ips, 2);
-        c.add(Seen::Success { service: "ssh", ip: "203.0.113.5".into(), user: "u1".into() }, t + 100);
+        c.add(Seen::Success { service: "ssh", proto: "", ip: "203.0.113.5".into(), user: "u1".into() }, t + 100);
         assert_eq!(c.events.len(), 1);
         assert_eq!(c.events[0].failures, 12);
-        c.add(Seen::Success { service: "ssh", ip: "203.0.113.5".into(), user: "u1".into() }, t + 110);
+        c.add(Seen::Success { service: "ssh", proto: "", ip: "203.0.113.5".into(), user: "u1".into() }, t + 110);
         assert_eq!(c.events.len(), 1); // a second login after the same series — no second alarm
         let r = c.report("linux", t + 120, true);
         assert!(r.attackers.is_empty()); // logged in now — not for the shared list
@@ -353,5 +475,47 @@ mod tests {
         assert_eq!(d.ips[0].users[0], ("u0".into(), 4));
         c.prune(t + KEEP + 3600);
         assert!(c.ips.is_empty() && c.windows.is_empty() && c.events.is_empty());
+    }
+
+    #[test]
+    fn known_networks() {
+        let mut c = Counters::default();
+        let t = 1_800_000_000;
+        let ok = |ip: &str| Seen::Success { service: "mail", proto: "imap", ip: ip.into(), user: "Jana".into() };
+        let fail = |ip: &str| Seen::Failure { service: "mail", proto: "imap", ip: ip.into(), user: "jana".into() };
+        c.add(ok("198.51.100.20"), t); // her usual network
+        c.add_n(fail("198.51.100.77"), t + 100, 8); // her phone with an old password, the same /24
+        c.add(ok("198.51.100.77"), t + 200);
+        assert!(c.events.is_empty()); // known network (the name in any case) — no alarm
+        c.add_n(fail("203.0.113.5"), t + 300, 6);
+        c.add(ok("203.0.113.5"), t + 400);
+        assert_eq!(c.events.len(), 1); // a new network after a series — alarm
+        assert_eq!(c.events[0].net, "203.0.113.0/24");
+        assert_eq!(c.ips["203.0.113.5"].protos["imap"], 6);
+        c.add_n(Seen::Failure { service: "ftp", proto: "", ip: "198.51.100.99".into(), user: "x".into() }, t + 310, 2);
+        c.add_n(Seen::Failure { service: "mail", proto: "smtp", ip: "198.51.100.99".into(), user: "x".into() }, t + 320, 3);
+        let d = c.report("linux", t + 330, true).details.unwrap();
+        let ip = d.ips.iter().find(|i| i.ip == "198.51.100.99").unwrap();
+        assert_eq!((ip.service.as_str(), ip.services.len()), ("mail", 2)); // the service with most failures
+        assert_eq!(d.protos["mail"]["smtp"], 3); // protocols are mail's, whatever the address tried first
+        c.add_n(fail("203.0.113.5"), t + 500, 6);
+        c.add(ok("203.0.113.5"), t + 600);
+        assert_eq!(c.events.len(), 1); // now known
+        c.add_n(fail("2001:db8:1:2:aaaa::1"), t + 700, 5);
+        c.add(ok("2001:db8:1:2:bbbb::9"), t + 800);
+        assert_eq!(c.events.len(), 1); // series from one address, login from another of the same /64: not a series
+        c.add_n(fail("2001:db8:1:2:bbbb::9"), t + 900, 5);
+        c.add(ok("2001:db8:1:2:bbbb::9"), t + 1000);
+        assert_eq!(c.events.len(), 1); // the /64 is known since t + 800
+        // the same network for another account or service is not known
+        c.add_n(fail("198.51.100.20"), t + 1100, 5);
+        c.add(Seen::Success { service: "ftp", proto: "", ip: "198.51.100.20".into(), user: "jana".into() }, t + 1200);
+        assert_eq!(c.events.len(), 2);
+        // forgotten after 90 days
+        c.prune(t + KNOWN_KEEP + 1300);
+        assert!(c.known.is_empty());
+        let r = c.report("linux", t, true);
+        assert!(r.details.is_some());
+        assert_eq!(address("::ffff:198.51.100.7").as_deref(), Some("198.51.100.7"));
     }
 }

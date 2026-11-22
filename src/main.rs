@@ -3,6 +3,8 @@
 mod auth;
 #[cfg(unix)]
 mod auth_linux;
+#[cfg(unix)]
+mod auth_parse;
 mod client;
 mod daemon;
 #[cfg(unix)]
@@ -32,7 +34,7 @@ pub fn log(msg: &str) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cybercop-agent <command>\n\n  enroll [--server URL] CODE   register this server with a one-time code from the control centre\n  run                           work as a service\n  inventory                     print the inventory as JSON (nothing is sent)\n  indicators                    print the break-in indicators as JSON (nothing is sent)\n  auth [--details]              one pass over new SSH/RDP log records, print the password guessing summary (nothing is sent)\n  version                       print the version"
+        "usage: cybercop-agent <command>\n\n  enroll [--server URL] CODE   register this server with a one-time code from the control centre\n  run                           work as a service\n  inventory                     print the inventory as JSON (nothing is sent)\n  indicators                    print the break-in indicators as JSON (nothing is sent)\n  auth [--details]              one pass over new SSH/RDP/mail/FTP log records, print the password guessing summary (nothing is sent)\n  version                       print the version"
     );
     std::process::exit(2)
 }
