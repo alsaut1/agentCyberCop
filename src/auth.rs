@@ -308,6 +308,7 @@ impl Counters {
             events,
             attackers,
             details: details.then(|| self.details(now)),
+            notes: Vec::new(),
         }
     }
 
@@ -418,6 +419,9 @@ pub struct Report {
     pub attackers: Vec<Attacker>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Details>,
+    /// what limits the summary on this server: `vsftpd_no_own_log` — vsftpd writes no log of its own (see `auth_parse`)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[cfg(test)]

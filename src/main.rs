@@ -135,7 +135,9 @@ fn auth_once(details: bool) -> i32 {
         let mut s = auth_linux::load();
         auth_linux::poll(&mut s, now);
         auth_linux::save(&s);
-        s.counters.report("linux", now, details)
+        let mut r = s.counters.report("linux", now, details);
+        r.notes = auth_linux::notes(&s);
+        r
     };
     #[cfg(windows)]
     let report = {

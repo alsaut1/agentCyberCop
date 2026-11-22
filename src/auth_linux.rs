@@ -229,6 +229,9 @@ fn wtmp(s: &mut State) {
 
 /// One pass: new records into the counters. The first pass of this version also reads the old logs once.
 pub fn poll(s: &mut State, now: u64) {
+    if let Some(conf) = vsftpd_conf() {
+        s.vsftpd_own = vsftpd_own_log(&conf); // the settings now, not only the lines seen before
+    }
     // the servers' own logs first: vsftpd's own lines decide whether its PAM lines in the journal are counted
     for (path, kind) in OWN {
         if Path::new(path).exists() {
@@ -250,6 +253,38 @@ pub fn poll(s: &mut State, now: u64) {
         s.seeded = true;
     }
     s.counters.prune(now);
+}
+
+/// vsftpd settings → does it write its own log (with addresses and logins)?
+/// Its own log is written with `dual_log_enable=YES`, or with `xferlog_enable=YES` and `xferlog_std_format` not YES
+/// (then it goes to syslog with `syslog_enable=YES` — still its own lines).
+pub fn vsftpd_own_log(conf: &str) -> bool {
+    let mut opt = BTreeMap::new();
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            opt.insert(k.trim().to_ascii_lowercase(), v.trim().eq_ignore_ascii_case("yes"));
+        }
+    }
+    let on = |k: &str| opt.get(k).copied().unwrap_or(false);
+    on("dual_log_enable") || (on("xferlog_enable") && !on("xferlog_std_format"))
+}
+
+fn vsftpd_conf() -> Option<String> {
+    ["/etc/vsftpd.conf", "/etc/vsftpd/vsftpd.conf"].iter().find_map(|p| fs::read_to_string(p).ok())
+}
+
+/// What limits the summary on this server, for the control centre to tell the client.
+/// By the settings only: the lines seen before say nothing about the settings now.
+pub fn notes(_s: &State) -> Vec<String> {
+    let installed = ["/usr/sbin/vsftpd", "/usr/bin/vsftpd"].iter().any(|p| Path::new(p).exists());
+    if installed && !vsftpd_conf().as_deref().is_some_and(vsftpd_own_log) {
+        return vec!["vsftpd_no_own_log".into()];
+    }
+    Vec::new()
 }
 
 // ---- once, on the first start: the old logs, only successful logins → known networks ----
@@ -412,6 +447,16 @@ mod tests {
         assert!(parse_line(Kind::Syslog { ftp_only: true }, "Nov 22 20:58:01 mail dovecot[1]: imap-login: Login: user=<a>, rip=198.51.100.20, lip=192.0.2.1", false).is_none());
         assert!(parse_line(Kind::Syslog { ftp_only: false }, "Nov 22 20:58:01 mail dovecot[1]: imap-login: Login: user=<a>, rip=198.51.100.20, lip=192.0.2.1", false).is_some());
         assert!(parse_line(Kind::Syslog { ftp_only: true }, "Nov 22 20:58:01 web pure-ftpd[7]: (?@203.0.113.5) [WARNING] Authentication failed for user [a]", false).is_some());
+    }
+
+    #[test]
+    fn vsftpd_settings() {
+        // Red Hat default: the standard transfer log only — no log of its own
+        assert!(!vsftpd_own_log("anonymous_enable=NO\nxferlog_enable=YES\nxferlog_std_format=YES\n"));
+        assert!(vsftpd_own_log("xferlog_enable=YES\nxferlog_std_format=YES\ndual_log_enable=YES\n"));
+        // Debian default: xferlog_std_format commented out → its own format
+        assert!(vsftpd_own_log("xferlog_enable=YES\n#xferlog_std_format=YES\n"));
+        assert!(!vsftpd_own_log("#xferlog_enable=YES\n"));
     }
 
     #[test]

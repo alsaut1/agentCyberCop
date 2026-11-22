@@ -49,6 +49,8 @@ installed costs nothing: its files do not exist and the journal filter does not 
 vsftpd with its default settings on Red Hat-like systems writes no line of its own about logins, and in the PAM line
 it writes the client's host name instead of its address when the address has one; such attempts cannot be counted by
 address. With `dual_log_enable=YES` (or `xferlog_std_format=NO`) vsftpd writes its own log with addresses and logins.
+The agent tells the control centre when vsftpd is installed without its own log (by its settings), and the client
+sees a hint there.
 
 Measured cost on small servers: a pass 11–30 ms of processor time, no disk reads, 2–3 KB of state; the one-time
 reading of old logs about 0.5 s for a few MB, and about 2 s of wall time for 3 million lines (320 MB of text).

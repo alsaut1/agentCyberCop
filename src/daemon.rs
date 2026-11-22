@@ -102,7 +102,8 @@ pub fn run() -> i32 {
         }
         let new_events = auth.counters.events.len() != t.sent_events;
         if now.saturating_sub(t.last_auth_sent) >= indicators_every || new_events || t.want_auth_details {
-            let report = auth.counters.report("linux", now, t.want_auth_details);
+            let mut report = auth.counters.report("linux", now, t.want_auth_details);
+            report.notes = crate::auth_linux::notes(&auth);
             let body = serde_json::to_vec(&report).expect("json");
             match client::signed(&cfg.server, &cfg.agent_id, &key, "/agent-api/v1/auth", &body) {
                 Ok(_) => {
