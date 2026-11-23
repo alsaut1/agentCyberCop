@@ -191,15 +191,68 @@ fn new_bytes(files: &mut BTreeMap<String, Pos>, path: &str, unit: usize, new_fro
     Some(buf)
 }
 
-fn read_text(s: &mut State, path: &str, kind: Kind, now: u64) {
+fn read_text(s: &mut State, path: &str, kind: Kind, now: u64, zone: i64) {
     let Some(buf) = new_bytes(&mut s.files, path, 1, s.seeded) else { return };
     for line in String::from_utf8_lossy(&buf).lines() {
         if kind == Kind::Vsftpd && auth_parse::vsftpd_own(line).is_some() {
             s.vsftpd_own = true;
         }
-        // the time in these files has no zone (and syslog none of the year); the pass time is close enough
-        add(&mut s.counters, parse_line(kind, line, s.vsftpd_own), now);
+        add(&mut s.counters, parse_line(kind, line, s.vsftpd_own), recent_time(line, now, zone));
     }
+}
+
+/// The time of a line just read: from the line itself (its zone, or the server's), if it is within the last hour;
+/// otherwise — a wrong clock, an unknown format — the time of the pass.
+pub fn recent_time(line: &str, now: u64, zone: i64) -> u64 {
+    line_utc(line, now, zone).filter(|t| *t <= now + 60 && t + 3600 >= now).map(|t| t.min(now)).unwrap_or(now)
+}
+
+/// The server's zone now, seconds east of UTC («date +%z»: +0100 → 3600); 0 if unknown.
+pub fn local_zone() -> i64 {
+    Command::new("date")
+        .arg("+%z")
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| parse_zone(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or(0)
+}
+
+/// «+0100», «-05:30», «Z» → seconds east of UTC.
+fn parse_zone(z: &str) -> Option<i64> {
+    if z == "Z" {
+        return Some(0);
+    }
+    let sign = match z.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits: String = z[1..].chars().filter(|c| *c != ':').collect();
+    if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(sign * (digits[0..2].parse::<i64>().ok()? * 3600 + digits[2..4].parse::<i64>().ok()? * 60))
+}
+
+/// The time of a line in UTC: its own zone if it has one (ISO 8601 with «+01:00» or «Z»), otherwise the server's.
+pub fn line_utc(line: &str, now: u64, zone: i64) -> Option<u64> {
+    let local = line_time(line, now + zone.max(0) as u64)? as i64;
+    let b = line.as_bytes();
+    let own = if b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && (b[10] == b'T' || b[10] == b' ') {
+        let mut i = 19;
+        if b.get(i) == Some(&b'.') || b.get(i) == Some(&b',') {
+            i += 1;
+            while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                i += 1;
+            }
+        }
+        let tail: String = line[i..].chars().take_while(|c| !c.is_whitespace()).collect();
+        parse_zone(&tail)
+    } else {
+        None
+    };
+    u64::try_from(local - own.unwrap_or(zone)).ok()
 }
 
 /// wtmp records: (line, user, host, time). ProFTPD writes «ftpd<pid>» with the client address.
@@ -232,10 +285,11 @@ pub fn poll(s: &mut State, now: u64) {
     if let Some(conf) = vsftpd_conf() {
         s.vsftpd_own = vsftpd_own_log(&conf); // the settings now, not only the lines seen before
     }
+    let zone = local_zone();
     // the servers' own logs first: vsftpd's own lines decide whether its PAM lines in the journal are counted
     for (path, kind) in OWN {
         if Path::new(path).exists() {
-            read_text(s, path, *kind, now);
+            read_text(s, path, *kind, now, zone);
         }
     }
     let have_journal = journal(s, now);
@@ -243,7 +297,7 @@ pub fn poll(s: &mut State, now: u64) {
         for group in SYSLOG {
             if let Some(path) = group.iter().find(|p| Path::new(p).exists()) {
                 let ftp_only = group.contains(&"/var/log/messages");
-                read_text(s, path, Kind::Syslog { ftp_only }, now);
+                read_text(s, path, Kind::Syslog { ftp_only }, now, zone);
             }
         }
     }
@@ -350,7 +404,7 @@ fn learn(c: &mut Counters, seen: Option<(Seen, u32)>, at: u64, now: u64) {
     }
 }
 
-fn seed_file(c: &mut Counters, path: &str, kind: Kind, now: u64) {
+fn seed_file(c: &mut Counters, path: &str, kind: Kind, now: u64, zone: i64) {
     let Some(r) = open_any(path) else { return };
     let mtime = fs::metadata(path).map(|m| m.mtime() as u64).unwrap_or(now);
     let mut r = BufReader::new(r);
@@ -362,7 +416,7 @@ fn seed_file(c: &mut Counters, path: &str, kind: Kind, now: u64) {
             k => parse_line(k, &line, true),
         };
         if seen.is_some() {
-            learn(c, seen, line_time(&line, now).unwrap_or(mtime), now);
+            learn(c, seen, line_utc(&line, now, zone).unwrap_or(mtime), now);
         }
         buf.clear();
     }
@@ -407,8 +461,9 @@ pub fn seed(c: &mut Counters, now: u64) {
             files.extend(rotated(path).into_iter().map(|p| (p, Kind::Syslog { ftp_only: false })));
         }
     }
+    let zone = local_zone();
     for (path, kind) in files {
-        seed_file(c, &path, kind, now);
+        seed_file(c, &path, kind, now, zone);
     }
     for path in rotated(WTMP) {
         let Some(mut r) = open_any(&path) else { continue };
@@ -468,6 +523,27 @@ mod tests {
         assert_eq!(line_time("Nov 22 20:58:01 web sshd[1]: x", now), auth::civil(2026, 11, 22, 20, 58, 1));
         assert_eq!(line_time("Dec 30 10:00:00 web sshd[1]: x", now), auth::civil(2025, 12, 30, 10, 0, 0)); // not in the future
         assert_eq!(line_time("garbage", now), None);
+    }
+
+    #[test]
+    fn zones_and_recent_times() {
+        use super::{line_utc, parse_zone, recent_time};
+        assert_eq!(parse_zone("+0100"), Some(3600));
+        assert_eq!(parse_zone("-05:30"), Some(-19800));
+        assert_eq!(parse_zone("Z"), Some(0));
+        assert_eq!(parse_zone("CET"), None);
+        let now = auth::civil(2026, 11, 23, 12, 0, 0).unwrap();
+        // no zone in the line: the server's (Prague, +1)
+        assert_eq!(line_utc("2026-11-23 12:30:00 dovecot_plain authenticator failed", now, 3600), auth::civil(2026, 11, 23, 11, 30, 0));
+        assert_eq!(line_utc("Nov 23 12:30:00 web sshd[1]: x", now, 3600), auth::civil(2026, 11, 23, 11, 30, 0));
+        // its own zone wins
+        assert_eq!(line_utc("2026-11-23T11:30:00.5+00:00 web sshd[1]: x", now, 3600), auth::civil(2026, 11, 23, 11, 30, 0));
+        assert_eq!(line_utc("2026-11-23T12:30:00+01:00 web sshd[1]: x", now, 0), auth::civil(2026, 11, 23, 11, 30, 0));
+        // a line read now: its own time if within the hour, else the pass time
+        assert_eq!(recent_time("2026-11-23 12:59:23,876 web proftpd[1]", now, 3600), now - 37);
+        assert_eq!(recent_time("2026-11-23 08:00:00,000 web proftpd[1]", now, 3600), now);
+        assert_eq!(recent_time("2026-11-23 13:30:00,000 web proftpd[1]", now, 0), now);    // in the future
+        assert_eq!(recent_time("no time here", now, 0), now);
     }
 
     #[test]

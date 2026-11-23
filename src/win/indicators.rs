@@ -56,6 +56,9 @@ pub struct ServiceEntry {
     pub program: String,
     pub account: String,
     pub start: String,
+    /// SHA-256 of the whole command line: the control centre sees that the arguments changed, never the arguments.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -235,7 +238,7 @@ pub fn collect() -> Indicators {
     let (svcs, by_pid) = inventory::services(&mut errors);
     let services = svcs
         .into_iter()
-        .map(|s| ServiceEntry { name: s.name, program: s.program, account: s.account, start: s.start })
+        .map(|s| ServiceEntry { name: s.name, program: s.program, account: s.account, start: s.start, id: s.command_id })
         .collect();
     Indicators {
         schema: SCHEMA,

@@ -115,7 +115,10 @@ pub fn vsftpd_pam(msg: &str) -> Option<(Seen, u32)> {
     if !msg.starts_with("pam_unix(vsftpd:auth): authentication failure;") {
         return None;
     }
-    let ip = address(between(msg, " rhost=", " ")?)?; // a host name instead of an address: not usable
+    // vsftpd on RHEL writes the host name instead of the address (reverse_lookup_enable=YES): the attempt is still
+    // counted, without an address (no series, no shared list)
+    let rhost = between(msg, " rhost=", " ").unwrap_or_default();
+    let ip = address(rhost).unwrap_or_default();
     let user = between(msg, " ruser=", " ").filter(|u| !u.is_empty()).or_else(|| between(msg, " user=", " ")).map(name).unwrap_or_default();
     Some((Seen::Failure { service: "ftp", proto: "", ip, user }, 1))
 }
@@ -240,7 +243,11 @@ mod tests {
             vsftpd_pam("pam_unix(vsftpd:auth): authentication failure; logname= uid=0 euid=0 tty=ftp ruser=jana rhost=203.0.113.5  user=jana"),
             fail("ftp", "", "203.0.113.5", "jana", 1)
         );
-        assert_eq!(vsftpd_pam("pam_unix(vsftpd:auth): authentication failure; logname= uid=0 euid=0 tty=ftp ruser=jana rhost=host.example.net  user=jana"), None);
+        // a host name instead of the address: counted, without an address
+        assert_eq!(
+            vsftpd_pam("pam_unix(vsftpd:auth): authentication failure; logname= uid=0 euid=0 tty=ftp ruser=jana rhost=host.example.net  user=jana"),
+            fail("ftp", "", "", "jana", 1)
+        );
         assert_eq!(by_program("vsftpd", "pam_unix(vsftpd:auth): authentication failure; logname= uid=0 euid=0 tty=ftp ruser=x rhost=203.0.113.5 ", true), None);
         assert_eq!(
             proftpd("2026-11-22 21:02:41,621 web proftpd[16318] 192.0.2.1 (203.0.113.5[203.0.113.5]): USER jana (Login failed): Incorrect password"),

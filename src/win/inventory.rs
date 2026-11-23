@@ -72,6 +72,10 @@ pub struct Service {
     pub account: String,
     /// The program only, never the arguments (they may contain secrets).
     pub program: String,
+    /// SHA-256 of the whole command line (program and arguments): tells that the arguments changed without sending
+    /// them. Only for the compromise indicators, not in the inventory.
+    #[serde(skip)]
+    pub command_id: String,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -262,7 +266,7 @@ pub fn services(errors: &mut Vec<String>) -> (Vec<Service>, HashMap<u32, Vec<Str
                     7 => "paused",
                     _ => "unknown",
                 };
-                let (mut start, mut account, mut program) = (String::new(), String::new(), String::new());
+                let (mut start, mut account, mut program, mut command_id) = (String::new(), String::new(), String::new(), String::new());
                 if let Some(k) = reg.as_ref().and_then(|r| r.open_subkey_with_flags(&name, KEY_READ | KEY_WOW64_64KEY).ok()) {
                     start = match (dw(&k, "Start"), dw(&k, "DelayedAutostart")) {
                         (Some(2), Some(1)) => "auto-delayed",
@@ -275,12 +279,16 @@ pub fn services(errors: &mut Vec<String>) -> (Vec<Service>, HashMap<u32, Vec<Str
                     }
                     .into();
                     account = s(&k, "ObjectName");
-                    program = program_of(&s(&k, "ImagePath"));
+                    let image = s(&k, "ImagePath");
+                    program = program_of(&image);
+                    if !image.is_empty() {
+                        command_id = super::updates::sha256_hex(image.as_bytes());
+                    }
                 }
                 if st.dwProcessId != 0 {
                     by_pid.entry(st.dwProcessId).or_default().push(name.clone());
                 }
-                out.push(Service { name, display_name, state: state.into(), start, account, program });
+                out.push(Service { name, display_name, state: state.into(), start, account, program, command_id });
             }
             if !more {
                 break;

@@ -181,11 +181,14 @@ impl Counters {
             Seen::Failure { service, proto, ip, user } => {
                 let w = self.windows.entry(start).or_default().entry(service.into()).or_default();
                 w.attempts += 1;
-                if w.ips.len() < MAX_SET {
+                if w.ips.len() < MAX_SET && !ip.is_empty() {
                     w.ips.insert(ip.clone());
                 }
                 if w.users.len() < MAX_SET {
                     w.users.insert(user.clone());
+                }
+                if ip.is_empty() {
+                    return; // no address (vsftpd wrote a host name): only the window counts it
                 }
                 let e = self.ips.entry(ip).or_insert_with(|| Ip { service: service.into(), first: at, ..Default::default() });
                 e.last = e.last.max(at);
@@ -479,6 +482,16 @@ mod tests {
         assert_eq!(d.ips[0].users[0], ("u0".into(), 4));
         c.prune(t + KEEP + 3600);
         assert!(c.ips.is_empty() && c.windows.is_empty() && c.events.is_empty());
+    }
+
+    #[test]
+    fn failure_without_address_counts_only_in_the_window() {
+        let mut c = Counters::default();
+        let t = 1_795_300_000;
+        c.add(Seen::Failure { service: "ftp", proto: "", ip: String::new(), user: "anonymous".into() }, t);
+        let w = &c.windows.values().next().unwrap()["ftp"];
+        assert_eq!((w.attempts, w.ips.len(), w.users.len()), (1, 0, 1));
+        assert!(c.ips.is_empty());
     }
 
     #[test]

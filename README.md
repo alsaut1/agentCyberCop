@@ -25,9 +25,12 @@ Windows:
   vulnerabilities each update fixes in Microsoft's Security Update Guide. For third-party programs only the list is
   kept;
 - signs of a break-in: new users (and who is an administrator), new Task Scheduler tasks, new services, new
-  listening ports. Tasks as name, program path and a hash of the action, never the arguments.
+  listening ports. Tasks and services as name, program path and a hash of the whole command, never the arguments:
+  the control centre sees that a task or a service now runs another program, other arguments or under another
+  account.
 
-Both: the path of the agent's own file and its SHA-256, so the control centre can tell the agent's own user,
+Both: the server's clock in each heartbeat (so the control centre can tell when it is off), the path of the agent's
+own file and its SHA-256, so the control centre can tell the agent's own user,
 service and task (the installer created them, the file matches a signed release) from look-alikes.
 
 Windows also: installed application compatibility databases (`sdbinst`): GUID, path, SHA-256 and what is inside —
@@ -44,11 +47,15 @@ the start, on its first start the agent reads once the old logs still on the ser
 successful logins only. Addresses with 10 or more failures within an hour, and no successful login from them, are
 sent for the shared list of attacking addresses. Addresses with counts and the user names tried (for mail, sending
 and receiving apart) are sent only when the server's owner asks for them in the control centre. A server that is not
-installed costs nothing: its files do not exist and the journal filter does not match.
+installed costs nothing: its files do not exist and the journal filter does not match. The time of a record is taken
+from the record itself (its own zone, or the server's zone when the line has none) if it is within the last hour,
+otherwise the time of the pass.
 
 vsftpd with its default settings on Red Hat-like systems writes no line of its own about logins, and in the PAM line
-it writes the client's host name instead of its address when the address has one; such attempts cannot be counted by
-address. With `dual_log_enable=YES` (or `xferlog_std_format=NO`) vsftpd writes its own log with addresses and logins.
+it writes the client's host name instead of its address when the address has one; such attempts are counted in the
+summary without an address (no series, no shared list). With `dual_log_enable=YES` (or `xferlog_std_format=NO`) vsftpd
+writes its own log with addresses and logins; on Red Hat-like systems `reverse_lookup_enable=NO` keeps the address in
+the PAM line (logins are still not seen there).
 The agent tells the control centre when vsftpd is installed without its own log (by its settings), and the client
 sees a hint there.
 

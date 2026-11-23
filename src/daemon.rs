@@ -22,7 +22,10 @@ pub struct Asked {
 
 /// One heartbeat: tells the version and platform, takes an offered update (download and check only).
 pub fn heartbeat(cfg: &state::Config, key: &ed25519_dalek::SigningKey) -> Result<Asked, client::Error> {
-    let body = serde_json::json!({"version": crate::VERSION, "arch": crate::update::ARCH}).to_string();
+    // "clock": this machine's own time without the correction the client keeps after a "clock" refusal — the control
+    // centre tells the client when the server clock is off, and judges the age of reports by it.
+    let body = serde_json::json!({"version": crate::VERSION, "arch": crate::update::ARCH,
+                                  "clock": crate::inventory::now()}).to_string();
     let answer = client::signed(&cfg.server, &cfg.agent_id, key, "/agent-api/v1/heartbeat", body.as_bytes())?;
     if let Ok(offer) = serde_json::from_value::<crate::update::Offer>(answer["update"].clone())
         && let Err(e) = crate::update::fetch(&offer) {
