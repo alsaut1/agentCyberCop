@@ -13,8 +13,15 @@ Linux:
   against the security advisories of the distribution itself (with [Trivy](https://github.com/aquasecurity/trivy));
 - running services, listening ports, Docker images (only if the agent user is added to the `docker` group);
 - versions of site engines (WordPress with plugins, Joomla, Drupal);
-- signs of a break-in: new users (name, uid, home folder, shell), new SSH keys (fingerprint and the `authorized_keys`
-  file, never the key itself or its comment), new scheduled tasks, new listening ports.
+- signs of a break-in: new users (name, uid, home folder, shell) and who is in the `sudo`, `wheel` or `admin` group,
+  new SSH keys (fingerprint and the `authorized_keys` file, never the key itself or its comment), scheduled tasks
+  (cron: file, schedule, the user it runs as, program path and a hash of the line), systemd timers with the unit they
+  start, systemd services (the loaded ones and the enabled ones not loaded yet; instances of a template once, under
+  the template name; short-lived run-time services are skipped) with their file, the user they run as, program path
+  and a hash of the whole command, users' own services from `~/.config/systemd/user` and `/etc/systemd/user` (read
+  from the files), new listening ports, and when the package database last changed (so a change right after a
+  package update can be told apart). Never the arguments of a command: the control centre sees that a task or a
+  service now runs another program, other arguments or as another user.
 
 Windows:
 

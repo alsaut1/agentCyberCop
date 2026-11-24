@@ -15,6 +15,8 @@ mod release;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sdb;
 mod state;
+#[cfg(unix)]
+mod systemd;
 mod update;
 #[cfg(windows)]
 mod win;

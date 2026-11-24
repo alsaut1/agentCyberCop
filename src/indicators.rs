@@ -1,9 +1,11 @@
-//! Signs of a break-in, sent every 15 minutes: users, SSH keys, scheduled tasks, listening ports. The control centre
-//! remembers the first report as the baseline and raises an alarm on anything new.
+//! Signs of a break-in, sent every 15 minutes: users (and who is in the sudo, wheel or admin group), SSH keys,
+//! scheduled tasks, systemd timers and services, users' own services, listening ports, and when the package database
+//! last changed. The control centre remembers the first report as the baseline and raises an alarm on anything new or
+//! changed.
 //!
 //! Nothing secret leaves the server: users without password hashes, SSH keys as fingerprints only (no comments),
-//! scheduled tasks as file, schedule, program name and a hash of the line — never the full command, which may contain
-//! passwords.
+//! scheduled tasks and services as file, schedule, user, program and a hash of the whole command line — never the
+//! arguments, which may contain passwords.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -20,9 +22,23 @@ pub struct Indicators {
     pub users: Vec<User>,
     pub ssh_keys: Vec<SshKey>,
     pub cron: Vec<CronEntry>,
-    pub timers: Vec<String>,
+    pub timers: Vec<Timer>,
+    pub services: Vec<crate::systemd::Service>,
+    pub user_services: Vec<crate::systemd::UserService>,
+    /// When the package database (dpkg or rpm) last changed, Unix seconds; 0 if unknown.
+    pub packages_changed_at: u64,
     pub ports: Vec<crate::inventory::ports::Port>,
 }
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Timer {
+    pub name: String,
+    /// The unit the timer starts.
+    pub unit: String,
+}
+
+/// Groups whose members may become root with sudo.
+pub const ADMIN_GROUPS: [&str; 3] = ["sudo", "wheel", "admin"];
 
 #[derive(Serialize, Debug, PartialEq)]
 pub struct User {
@@ -30,6 +46,11 @@ pub struct User {
     pub uid: u32,
     pub home: String,
     pub shell: String,
+    /// Member of sudo, wheel or admin (also as the primary group).
+    pub admin: bool,
+    pub admin_groups: Vec<String>,
+    #[serde(skip)]
+    pub gid: u32,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -46,6 +67,11 @@ pub struct CronEntry {
     pub file: String,
     pub schedule: String,
     pub program: String,
+    /// Program as written (first word of the command), or the script's full path.
+    pub path: String,
+    /// User the line runs as: the user field of /etc/crontab and /etc/cron.d, the owner of a user crontab, root for
+    /// the cron.daily-style folders.
+    pub user: String,
     pub id: String,
 }
 
@@ -53,9 +79,35 @@ pub fn parse_passwd(text: &str) -> Vec<User> {
     text.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split(':').collect();
-            (f.len() >= 7).then(|| User { name: f[0].into(), uid: f[2].parse().unwrap_or(u32::MAX), home: f[5].into(), shell: f[6].into() })
+            (f.len() >= 7).then(|| User {
+                name: f[0].into(),
+                uid: f[2].parse().unwrap_or(u32::MAX),
+                home: f[5].into(),
+                shell: f[6].into(),
+                admin: false,
+                admin_groups: Vec::new(),
+                gid: f[3].parse().unwrap_or(u32::MAX),
+            })
         })
         .collect()
+}
+
+/// /etc/group → mark members of sudo, wheel and admin (listed members and users with that primary group).
+pub fn mark_admins(users: &mut [User], group: &str) {
+    for l in group.lines() {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() < 4 || !ADMIN_GROUPS.contains(&f[0]) {
+            continue;
+        }
+        let gid: u32 = f[2].parse().unwrap_or(u32::MAX - 1);
+        let members: Vec<&str> = f[3].split(',').map(str::trim).filter(|m| !m.is_empty()).collect();
+        for u in users.iter_mut() {
+            if (members.contains(&u.name.as_str()) || u.gid == gid) && !u.admin_groups.iter().any(|g| g == f[0]) {
+                u.admin = true;
+                u.admin_groups.push(f[0].to_string());
+            }
+        }
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -98,8 +150,9 @@ fn ssh_keys(users: &[User], passwd: &str) -> Vec<SshKey> {
     out
 }
 
-/// Cron line → entry. `system` files (/etc/crontab, /etc/cron.d) have a user field after the schedule.
-pub fn parse_cron(file: &str, text: &str, system: bool) -> Vec<CronEntry> {
+/// Cron line → entry. `system` files (/etc/crontab, /etc/cron.d) have a user field after the schedule; a user crontab
+/// runs as `owner`.
+pub fn parse_cron(file: &str, text: &str, system: bool, owner: &str) -> Vec<CronEntry> {
     let mut out = Vec::new();
     for line in text.lines() {
         let l = line.trim();
@@ -116,9 +169,12 @@ pub fn parse_cron(file: &str, text: &str, system: bool) -> Vec<CronEntry> {
         } else {
             continue;
         };
+        let user = if system { rest.first().copied().unwrap_or("").to_string() } else { owner.to_string() };
         let rest = if system && !rest.is_empty() { &rest[1..] } else { rest };
-        let program = rest.first().map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default();
-        out.push(CronEntry { file: file.into(), schedule, program, id: sha256_hex(l.as_bytes())[..16].to_string() });
+        // A variable before the command (`PASS=x /opt/run`) may hold a secret: then no program at all.
+        let path = rest.first().filter(|p| !p.contains('=')).map(|p| p.to_string()).unwrap_or_default();
+        let program = path.rsplit('/').next().unwrap_or("").to_string();
+        out.push(CronEntry { file: file.into(), schedule, program, path, user, id: sha256_hex(l.as_bytes())[..16].to_string() });
     }
     out
 }
@@ -126,7 +182,7 @@ pub fn parse_cron(file: &str, text: &str, system: bool) -> Vec<CronEntry> {
 fn cron() -> Vec<CronEntry> {
     let mut out = Vec::new();
     if let Ok(t) = fs::read_to_string("/etc/crontab") {
-        out.extend(parse_cron("/etc/crontab", &t, true));
+        out.extend(parse_cron("/etc/crontab", &t, true, ""));
     }
     for (dir, system) in [("/etc/cron.d", true), ("/var/spool/cron/crontabs", false), ("/var/spool/cron", false)] {
         let Ok(rd) = fs::read_dir(dir) else { continue };
@@ -134,7 +190,8 @@ fn cron() -> Vec<CronEntry> {
         files.sort();
         for p in files {
             if let Ok(t) = fs::read_to_string(&p) {
-                out.extend(parse_cron(&p.to_string_lossy(), &t, system));
+                let owner = if system { String::new() } else { p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default() };
+                out.extend(parse_cron(&p.to_string_lossy(), &t, system, &owner));
             }
         }
     }
@@ -146,39 +203,70 @@ fn cron() -> Vec<CronEntry> {
                 continue;
             }
             let id = fs::read(e.path()).map(|d| sha256_hex(&d)[..16].to_string()).unwrap_or_default();
-            out.push(CronEntry { file: dir.into(), schedule: dir.trim_start_matches("/etc/cron.").into(), program: name, id });
+            let path = e.path().display().to_string();
+            out.push(CronEntry { file: dir.into(), schedule: dir.trim_start_matches("/etc/cron.").into(), program: name, path, user: "root".into(), id });
         }
     }
     out
 }
 
-fn timers() -> Vec<String> {
+/// `systemctl list-timers` lines → timers with the unit each one starts (the word after the timer).
+pub fn parse_timers(text: &str) -> Vec<Timer> {
+    let mut t: Vec<Timer> = text
+        .lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let i = w.iter().position(|x| x.ends_with(".timer"))?;
+            Some(Timer { name: w[i].to_string(), unit: w.get(i + 1).map(|s| s.to_string()).unwrap_or_default() })
+        })
+        .collect();
+    t.sort_by(|a, b| a.name.cmp(&b.name));
+    t.dedup_by(|a, b| a.name == b.name);
+    t
+}
+
+fn timers() -> Vec<Timer> {
     let out = std::process::Command::new("systemctl")
         .args(["list-timers", "--all", "--no-legend", "--plain", "--no-pager"])
         .output();
     let Ok(o) = out else { return Vec::new() };
-    let mut t: Vec<String> = String::from_utf8_lossy(&o.stdout)
-        .split_whitespace()
-        .filter(|w| w.ends_with(".timer"))
-        .map(String::from)
-        .collect();
-    t.sort();
-    t.dedup();
-    t
+    parse_timers(&String::from_utf8_lossy(&o.stdout))
+}
+
+/// Last change of the package database: dpkg's status file or the rpm database.
+fn packages_changed_at() -> u64 {
+    [
+        "/var/lib/dpkg/status",
+        "/var/lib/rpm/rpmdb.sqlite",
+        "/var/lib/rpm/Packages",
+        "/usr/lib/sysimage/rpm/rpmdb.sqlite",
+        "/usr/lib/sysimage/rpm/Packages",
+    ]
+    .iter()
+    .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+    .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    .map(|d| d.as_secs())
+    .max()
+    .unwrap_or(0)
 }
 
 pub fn collect() -> Indicators {
     let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
-    let users = parse_passwd(&passwd);
+    let mut users = parse_passwd(&passwd);
+    mark_admins(&mut users, &fs::read_to_string("/etc/group").unwrap_or_default());
     let keys = ssh_keys(&users, &passwd);
+    let homes: Vec<(String, String)> = users.iter().map(|u| (u.name.clone(), u.home.clone())).collect();
     Indicators {
-        schema: 1,
+        schema: 2,
         collected_at: crate::inventory::now(),
         agent: crate::update::agent_self(),
-        users,
         ssh_keys: keys,
         cron: cron(),
         timers: timers(),
+        services: crate::systemd::services(),
+        user_services: crate::systemd::user_services(&homes),
+        packages_changed_at: packages_changed_at(),
+        users,
         ports: crate::inventory::ports::collect(),
     }
 }
@@ -189,8 +277,21 @@ mod tests {
 
     #[test]
     fn passwd() {
-        let u = parse_passwd("root:x:0:0:root:/root:/bin/bash\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\n");
-        assert_eq!(u[0], User { name: "root".into(), uid: 0, home: "/root".into(), shell: "/bin/bash".into() });
+        let mut u = parse_passwd("root:x:0:0:root:/root:/bin/bash\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nann:x:1001:1001::/home/ann:/bin/bash\nbob:x:1002:10::/home/bob:/bin/sh\n");
+        assert_eq!((u[0].name.as_str(), u[0].uid, u[0].home.as_str(), u[0].shell.as_str()), ("root", 0, "/root", "/bin/bash"));
+        mark_admins(&mut u, "root:x:0:\nsudo:x:27:ann,other\nwheel:x:10:\nadm:x:4:bin\n");
+        assert_eq!((u[2].admin, u[2].admin_groups.clone()), (true, vec!["sudo".to_string()]));
+        assert_eq!((u[3].admin, u[3].admin_groups.clone()), (true, vec!["wheel".to_string()]));   // primary group
+        assert!(!u[0].admin && !u[1].admin);
+        assert!(!serde_json::to_string(&u[0]).unwrap().contains("gid"));
+    }
+
+    #[test]
+    fn timers_with_units() {
+        let t = parse_timers("Mon 2026-01-05 00:00:00 UTC 5h left Sun 2026-01-04 00:00:00 UTC 18h ago logrotate.timer logrotate.service\n\
+- - - - backup.timer backup.service\n");
+        assert_eq!(t, vec![Timer { name: "backup.timer".into(), unit: "backup.service".into() },
+                           Timer { name: "logrotate.timer".into(), unit: "logrotate.service".into() }]);
     }
 
     #[test]
@@ -205,13 +306,14 @@ mod tests {
 
     #[test]
     fn cron_lines_without_commands() {
-        let e = parse_cron("/etc/cron.d/x", "SHELL=/bin/sh\n# c\n*/5 * * * * root /usr/bin/curl -u admin:secret http://x\n@reboot root /opt/a.sh\n", true);
-        assert_eq!(e.len(), 2);
-        assert_eq!((e[0].schedule.as_str(), e[0].program.as_str()), ("*/5 * * * *", "curl"));
-        assert_eq!(e[1].program, "a.sh");
+        let e = parse_cron("/etc/cron.d/x", "SHELL=/bin/sh\n# c\n*/5 * * * * root /usr/bin/curl -u admin:secret http://x\n@reboot www-data /opt/a.sh\n* * * * * root PASS=x /opt/b\n", true, "");
+        assert_eq!(e.len(), 3);
+        assert_eq!((e[0].schedule.as_str(), e[0].program.as_str(), e[0].path.as_str(), e[0].user.as_str()), ("*/5 * * * *", "curl", "/usr/bin/curl", "root"));
+        assert_eq!((e[1].program.as_str(), e[1].user.as_str()), ("a.sh", "www-data"));
+        assert_eq!((e[2].program.as_str(), e[2].path.as_str()), ("", ""));
         let json = serde_json::to_string(&e).unwrap();
-        assert!(!json.contains("secret") && !json.contains("admin"));
-        let u = parse_cron("/var/spool/cron/crontabs/alice", "0 3 * * * /opt/backup/run.sh --pw x\n", false);
-        assert_eq!(u[0].program, "run.sh");
+        assert!(!json.contains("secret") && !json.contains("admin") && !json.contains("PASS"));
+        let u = parse_cron("/var/spool/cron/crontabs/someone", "0 3 * * * /opt/backup/run.sh --pw x\n", false, "someone");
+        assert_eq!((u[0].program.as_str(), u[0].user.as_str()), ("run.sh", "someone"));
     }
 }
